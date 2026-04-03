@@ -1,0 +1,11 @@
+[package]
+name = "carplayd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+env_logger = "0.11.10"
+log = { version = "0.4.29", features = ["std"] }
+tokio = { version = "1.51.0", features = ["full"] }
+usb-gadget = "1.1.1"
