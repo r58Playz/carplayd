@@ -1,4 +1,5 @@
 use super::{
+	IAP1_INCOMPATIBLE_SEQUENCE, IAP2_DETECTION_SEQUENCE,
 	control_session::{
 		ControlMessageKind, IDENT_PARAM_FIRMWARE_VERSION, IDENT_PARAM_HARDWARE_VERSION,
 		IDENT_PARAM_MANUFACTURER, IDENT_PARAM_MODEL_IDENTIFIER, IDENT_PARAM_NAME,
@@ -7,6 +8,7 @@ use super::{
 	},
 	decoder::PacketStreamParser,
 	error::Iap2Error,
+	is_iap1_detection_response, is_iap2_detection_response,
 	link::{LinkRecord, LinkTransmitWindow},
 	packet::{LinkPacket, PacketKind},
 	sync::{LinkSynchronizationPayload, SessionDescriptor},
@@ -49,6 +51,7 @@ pub enum IdentificationOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineState {
+	WaitingForDetectionResponse,
 	WaitingForSyn,
 	WaitingForLinkAck,
 	WaitingForAuthenticationMaterial,
@@ -109,6 +112,7 @@ pub struct Iap2Machine {
 	state: MachineState,
 	local_sync_payload: LinkSynchronizationPayload,
 	link_record: LinkRecord,
+	detection_buffer: Vec<u8>,
 	parser: PacketStreamParser,
 	transmit_window: Option<LinkTransmitWindow>,
 	control_session_id: Option<u8>,
@@ -127,6 +131,7 @@ impl Iap2Machine {
 			state: MachineState::WaitingForSyn,
 			local_sync_payload: config.local_sync_payload,
 			link_record: LinkRecord::new(config.local_initial_psn),
+			detection_buffer: Vec::new(),
 			parser: PacketStreamParser::default(),
 			transmit_window: None,
 			control_session_id: None,
@@ -158,7 +163,11 @@ impl Iap2Machine {
 	}
 
 	pub fn start(&mut self) -> Result<Vec<MachineOutput>, Iap2Error> {
-		Ok(vec![self.start_link_synchronization()?])
+		self.state = MachineState::WaitingForDetectionResponse;
+		self.detection_buffer.clear();
+		Ok(vec![MachineOutput::Transmit(
+			IAP2_DETECTION_SEQUENCE.to_vec(),
+		)])
 	}
 
 	pub fn start_link_synchronization(&mut self) -> Result<MachineOutput, Iap2Error> {
@@ -169,6 +178,10 @@ impl Iap2Machine {
 	}
 
 	pub fn on_transport_bytes(&mut self, bytes: &[u8]) -> Result<Vec<MachineOutput>, Iap2Error> {
+		if matches!(self.state, MachineState::WaitingForDetectionResponse) {
+			return self.on_detection_bytes(bytes);
+		}
+
 		self.parser.push_bytes(bytes);
 		let mut outputs = Vec::new();
 		while let Some(packet) = self.parser.next_packet() {
@@ -180,6 +193,44 @@ impl Iap2Machine {
 
 	pub fn on_link_packet(&mut self, packet: LinkPacket) -> Result<Vec<MachineOutput>, Iap2Error> {
 		self.handle_incoming_link_packet(packet)
+	}
+
+	fn on_detection_bytes(&mut self, bytes: &[u8]) -> Result<Vec<MachineOutput>, Iap2Error> {
+		self.detection_buffer.extend_from_slice(bytes);
+
+		if let Some((range, detection_type)) = find_detection_response(&self.detection_buffer) {
+			let trailing = self.detection_buffer[range.end..].to_vec();
+			self.detection_buffer.clear();
+
+			let mut outputs = Vec::new();
+			match detection_type {
+				DetectionResponseType::Iap2 => {
+					outputs.push(self.start_link_synchronization()?);
+				}
+				DetectionResponseType::Iap1 => {
+					self.state = MachineState::Failed;
+					outputs.push(MachineOutput::Transmit(IAP1_INCOMPATIBLE_SEQUENCE.to_vec()));
+					return Ok(outputs);
+				}
+			}
+
+			if !trailing.is_empty() {
+				self.parser.push_bytes(&trailing);
+				while let Some(packet) = self.parser.next_packet() {
+					outputs.extend(self.on_link_packet(packet)?);
+				}
+			}
+
+			return Ok(outputs);
+		}
+
+		const DETECTION_PREFIX_KEEP: usize = 7;
+		if self.detection_buffer.len() > DETECTION_PREFIX_KEEP {
+			let drain = self.detection_buffer.len() - DETECTION_PREFIX_KEEP;
+			self.detection_buffer.drain(0..drain);
+		}
+
+		Ok(Vec::new())
 	}
 
 	fn handle_incoming_link_packet(
@@ -205,6 +256,7 @@ impl Iap2Machine {
 		}
 
 		match self.state {
+			MachineState::WaitingForDetectionResponse => {}
 			MachineState::WaitingForSyn => {
 				self.handle_waiting_for_syn(packet, &mut outputs)?;
 			}
@@ -584,8 +636,38 @@ impl Iap2Machine {
 		self.pending_auth_challenge = None;
 		self.last_identification = None;
 		self.auth_challenge_counter = 0;
+		self.detection_buffer.clear();
 		self.parser.clear();
 	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectionResponseType {
+	Iap2,
+	Iap1,
+}
+
+fn find_detection_response(
+	bytes: &[u8],
+) -> Option<(std::ops::Range<usize>, DetectionResponseType)> {
+	for start in 0..bytes.len() {
+		for len in [6usize, 5, 7, 8] {
+			let end = start + len;
+			if end > bytes.len() {
+				continue;
+			}
+
+			let window = &bytes[start..end];
+			if is_iap2_detection_response(window) {
+				return Some((start..end, DetectionResponseType::Iap2));
+			}
+			if is_iap1_detection_response(window) {
+				return Some((start..end, DetectionResponseType::Iap1));
+			}
+		}
+	}
+
+	None
 }
 
 fn find_control_session_id(
@@ -689,6 +771,20 @@ mod tests {
 	}
 
 	fn complete_link_handshake(machine: &mut Iap2Machine) {
+		let initial = machine.start().expect("start detection");
+		assert!(initial
+			.iter()
+			.any(|output| matches!(output, MachineOutput::Transmit(bytes) if bytes == &crate::iap2::IAP2_DETECTION_SEQUENCE)));
+
+		let detection = machine
+			.on_transport_bytes(&crate::iap2::IAP2_DETECTION_SEQUENCE)
+			.expect("handle detection response");
+		assert!(
+			detection
+				.iter()
+				.any(|output| matches!(output, MachineOutput::Transmit(_)))
+		);
+
 		let peer_sync = LinkSynchronizationPayload::recommended_for_transport(
 			TransportProfile::UsbHostFullSpeed,
 			vec![SessionDescriptor {
@@ -800,5 +896,43 @@ mod tests {
 				}
 			)
 		}));
+	}
+
+	#[test]
+	fn iap1_detection_response_marks_machine_failed_and_sends_incompatible() {
+		let mut machine = Iap2Machine::new(machine_config());
+		let _ = machine.start().expect("start detection");
+
+		let outputs = machine
+			.on_transport_bytes(&[0x55, 0x02, 0x00, 0x00, 0xfe])
+			.expect("handle iap1 detection response");
+
+		assert!(outputs.iter().any(|output| {
+			matches!(
+				output,
+				MachineOutput::Transmit(bytes) if bytes == &crate::iap2::IAP1_INCOMPATIBLE_SEQUENCE
+			)
+		}));
+		assert!(matches!(machine.state(), super::MachineState::Failed));
+	}
+
+	#[test]
+	fn detection_response_can_be_found_with_prefix_noise() {
+		let mut machine = Iap2Machine::new(machine_config());
+		let _ = machine.start().expect("start detection");
+
+		let outputs = machine
+			.on_transport_bytes(&[0x00, 0x11, 0x22, 0xff, 0x55, 0x02, 0x00, 0xee, 0x10])
+			.expect("handle noisy detection response");
+
+		assert!(
+			outputs
+				.iter()
+				.any(|output| matches!(output, MachineOutput::Transmit(_)))
+		);
+		assert!(matches!(
+			machine.state(),
+			super::MachineState::WaitingForSyn
+		));
 	}
 }

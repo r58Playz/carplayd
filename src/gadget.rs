@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use log::{debug, trace};
 use usb_gadget::{
 	Class, Config, Gadget, Id, Strings, default_udc,
@@ -10,6 +10,14 @@ const H2D_VENDOR_TYPE: u8 = 0x40;
 
 const APPLE_GET_CAPABILITIES: u8 = 0x53;
 const APPLE_USB_ROLE_SWITCH: u8 = 0x51;
+
+pub fn udc_name() -> Result<String> {
+	let udc = default_udc().context("failed to get UDC")?;
+	udc.name()
+		.to_os_string()
+		.into_string()
+		.map_err(|x| anyhow!("invalid udc name {x:?}"))
+}
 
 pub fn run_gadget(sn: &str) -> Result<bool> {
 	usb_gadget::remove_all().context("failed to remove usb gadgets")?;
@@ -25,7 +33,7 @@ pub fn run_gadget(sn: &str) -> Result<bool> {
 
 	let mut config = Config::new("CarPlay").with_function(handle);
 	config.max_power = 1000; // ma
-	let _reg = Gadget::new(
+	let reg = Gadget::new(
 		Class::vendor_specific(0xff, 0xff),
 		Id::new(0x05ac, 0x12a8), // iPhone 8 Plus
 		Strings::new("Apple Inc.", "iPhone", sn),
@@ -36,7 +44,7 @@ pub fn run_gadget(sn: &str) -> Result<bool> {
 
 	debug!("gadget bound to {:?}", udc.name());
 
-	loop {
+	let res = loop {
 		match custom.event().context("failed to receive gadget event")? {
 			Event::SetupHostToDevice(req) => {
 				trace!("gadget data sent: {:?}", req);
@@ -56,8 +64,8 @@ pub fn run_gadget(sn: &str) -> Result<bool> {
 				{
 					debug!("gadget received apple get supported capabilities");
 
-					req.send(&[0x01, 0x00, 0x00, 0x00])
-						.context("failed to send carplay capability back")?; // carplay
+					req.send(&[0x01, 0x00, 0x00, 0x00]) // carplay
+						.context("failed to send carplay capability back")?;
 				}
 			}
 			Event::Enable => {
@@ -75,5 +83,9 @@ pub fn run_gadget(sn: &str) -> Result<bool> {
 			}
 			_ => {}
 		}
-	}
+	};
+
+	reg.remove().context("failed to remove gadget")?;
+
+	res
 }
