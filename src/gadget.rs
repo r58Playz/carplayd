@@ -25,7 +25,7 @@ pub fn run_gadget(sn: &str) -> Result<bool> {
 
 	let mut config = Config::new("CarPlay").with_function(handle);
 	config.max_power = 1000; // ma
-	let reg = Gadget::new(
+	let _reg = Gadget::new(
 		Class::vendor_specific(0xff, 0xff),
 		Id::new(0x05ac, 0x12a8), // iPhone 8 Plus
 		Strings::new("Apple Inc.", "iPhone", sn),
