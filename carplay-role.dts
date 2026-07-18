@@ -1,0 +1,3 @@
+/dts-v1/;
+/plugin/;
+/ { fragment@0 { target = <&usb>; __overlay__ { dr_mode = "otg"; usb-role-switch; }; }; };

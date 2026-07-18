@@ -6,7 +6,7 @@ use tokio::task::spawn_blocking;
 
 use crate::{
 	gadget::{run_gadget, udc_name},
-	host::{UsbIap2, find_iap2_device},
+	host::find_iap2_device,
 };
 
 mod gadget;
@@ -23,38 +23,36 @@ async fn main() -> Result<()> {
 
 	let sn = std::env::args().nth(1).context("no serial provided")?;
 
-	let controller_name = spawn_blocking(|| udc_name())
+	let controller_name = spawn_blocking(udc_name)
 		.await?
 		.context("failed to get controller name")?;
 
 	debug!("got controller {controller_name}");
 
+	let role_switch_path = format!("/sys/class/usb_role/{controller_name}-role-switch/role");
 
 	info!("starting gadget mode");
 
-	let success = spawn_blocking(move || run_gadget(&sn))
-		.await?
-		.context("failed to run gadget")?;
+	tokio::fs::write(&role_switch_path, "device")
+		.await
+		.context("failed to force controller into gadget mode")?;
+
+	let success = run_gadget(&sn).await.context("failed to run gadget")?;
 	if !success {
 		error!("iAP2 accessory rejected us");
 		return Ok(());
 	}
 
-	debug!("resetting dwc2 for {controller_name}");
-	tokio::time::sleep(Duration::from_millis(100)).await;
-	tokio::fs::write("/sys/bus/platform/drivers/dwc2/unbind", &controller_name)
-		.await
-		.context("failed to unbind dwc2")?;
-	trace!("unbound dwc2 from {controller_name}");
-	tokio::time::sleep(Duration::from_millis(100)).await;
-	tokio::fs::write("/sys/bus/platform/drivers/dwc2/bind", &controller_name)
-		.await
-		.context("failed to bind dwc2")?;
-	trace!("bound dwc2 to {controller_name}");
-	tokio::time::sleep(Duration::from_millis(100)).await;
-
-
 	info!("starting host mode");
+	tokio::fs::write(&role_switch_path, "host")
+		.await
+		.context("failed to force controller into host mode")?;
+
+	// The car errors ~2s after the role switch, so this is the only window to see
+	// whether `echo host` actually started the host controller. Look in the dmesg
+	// tail for "connection id status change" (the OTG interrupt) + a device attach.
+	tokio::time::sleep(Duration::from_millis(150)).await;
+	host::dump_host_state(&role_switch_path).await;
 
 	let iap2_device = find_iap2_device()
 		.await
@@ -63,22 +61,8 @@ async fn main() -> Result<()> {
 		error!("carplay head unit not found");
 		return Ok(());
 	};
-	let iap2_interface = iap2_device
-		.claim_interface(iap2_interface_id)
-		.await
-		.context("failed to claim iap2 interface")?;
 
-	debug!(
-		"found iap2 device {:?} with iap2 interface number {iap2_interface_id}",
-		iap2_device.device_descriptor()
-	);
-
-	info!("starting iap2");
-
-	let mut iap2 = UsbIap2::new(iap2_interface).await.context("failed to bringup iap2")?;
-	iap2.until_carplay_ready().await.context("failed to poll iap2 until carplay ready")?;
-
-	info!("iap2 carplay ready");
+	info!("carplay head unit found {iap2_device:?} {iap2_interface_id:?}");
 
 	Ok(())
 }

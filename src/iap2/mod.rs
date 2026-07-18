@@ -1,94 +1,46 @@
-//! iAP2 primitives and an iPhone-side state machine for CarPlay bring-up.
+//! Minimal iAP2 implementation for faking an iPhone (the *device*) to a CarPlay
+//! head unit over the USB Device Mode HID transport.
 //!
-//! This module now includes:
-//! - Link-layer packet framing/checksums and SYN/ACK/EAK support (`56.2`, p434-446).
-//! - Control-session message codec for authentication/identification (`97.1`, `97.2`).
-//! - A high-level state machine that models device-side (iPhone role) sequencing for:
-//!   link sync -> control session v2 -> authentication + identification -> CarPlay ready.
+//! This is the mechanical link layer only — the parts that are identical for every
+//! connection yet cannot be hardcoded, because they depend on the car's random,
+//! per-packet sequence numbers and checksums:
 //!
-//! Feature decisions based on the spec:
-//! - CarPlay requires control session version 2 support (`56.3.2`, p456).
-//! - Authentication and identification ordering is device-chosen in control session v2 (`20.1`, p185).
-//! - Identification validation checks CarPlay-related parameters such as
-//!   `VehicleInformationComponent`, `USBHostTransportCarPlayInterfaceNumber`,
-//!   and `TransportSupportsCarPlay` (`97.2`, p906-911).
-//! - For development, the state machine can run with fake auth that always verifies the accessory
-//!   challenge response.
+//! - [`packet`]: the link-packet wire codec (framing + checksums) and [`Control`] bits.
+//! - [`Link`]: the link-layer driver — runs the detection/`SYN`/`SYN+ACK`/establish
+//!   handshake, tracks sequence & acknowledgement numbers, auto-acks inbound data,
+//!   and does the HID (de)framing for the USB Device Mode transport.
+//! - Lower-level pieces are exported too ([`wrap_input`], [`Reassembler`],
+//!   [`parse_set`], [`LinkSync`]) for debugging or bespoke handling.
 //!
-//! # Example
-//! ```rust,ignore
-//! use crate::iap2::{
-//!     state_machine::{Iap2Machine, Iap2MachineConfig, MachineOutput},
-//! };
+//! It intentionally omits everything that is *policy*: which control-session
+//! messages to send and when, and their contents (authentication is accept-only,
+//! identification, `DeviceTransportIdentifierNotification`, …). Drive that on top.
 //!
-//! let mut machine = Iap2Machine::new(Iap2MachineConfig::iphone_default());
-//!
-//! let outputs = machine.start()?;
-//! for output in outputs {
-//!     if let MachineOutput::Transmit(wire_bytes) = output {
-//!         // send `wire_bytes` over transport
+//! # Usage — you only touch payloads
+//! Hold one [`Link`] in config 2's task. In the EP0 `SET_REPORT` handler:
+//! ```ignore
+//! let out = link.receive(&set_report_data); // the recv_all() bytes
+//! for report in out.reports {
+//!     hid_tx.send_async(report.into()).await?; // detection echo / SYN+ACK / ACKs
+//! }
+//! if out.established {
+//!     // device drives auth: send RequestAuthenticationCertificate first
+//!     for report in link.send_control(request_auth_certificate()) {
+//!         hid_tx.send_async(report.into()).await?;
 //!     }
 //! }
-//!
-//! // on incoming transport bytes:
-//! let incoming = &[0xff, 0x5a /* ... */];
-//! let outputs = machine.on_transport_bytes(incoming)?;
-//! for output in outputs {
-//!     if let MachineOutput::Transmit(wire_bytes) = output {
-//!         // send `wire_bytes` over transport
-//!     }
+//! for (session, payload) in out.payloads {
+//!     // your script: pick the next message from what the car sent, then
+//!     // link.send_control(next_message()) and write the reports.
 //! }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
-//!
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)] // the message-script layer that consumes this is written separately
 
-pub mod checksum;
-pub mod control;
-pub mod control_session;
-pub mod decoder;
-pub mod error;
-pub mod link;
-pub mod packet;
-pub mod state_machine;
-pub mod sync;
+mod hid;
+mod link;
+pub mod msg;
+mod packet;
 
-pub const IAP2_DETECTION_SEQUENCE: [u8; 6] = [0xff, 0x55, 0x02, 0x00, 0xee, 0x10];
-pub const IAP2_DETECTION_INTERVAL_MS: u64 = 1000;
-
-pub const IAP1_INCOMPATIBLE_SEQUENCE: [u8; 18] = [
-	0xff, 0x55, 0x0e, 0x00, 0x13, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	0xff, 0xeb,
-];
-
-pub fn is_iap2_detection_response(bytes: &[u8]) -> bool {
-	bytes == IAP2_DETECTION_SEQUENCE
-}
-
-pub fn is_iap1_detection_response(bytes: &[u8]) -> bool {
-	matches!(
-		bytes,
-		[0x55, 0x04, 0x00, 0x02, 0x04, 0xee, 0x08]
-			| [0x55, 0x02, 0x00, 0x00, 0xfe]
-			| [0xff, 0x55, 0x04, 0x00, 0x02, 0x04, 0xee, 0x08]
-			| [0xff, 0x55, 0x02, 0x00, 0x00, 0xfe]
-	)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::{IAP2_DETECTION_SEQUENCE, is_iap1_detection_response, is_iap2_detection_response};
-
-	#[test]
-	fn identifies_iap2_probe_response() {
-		assert!(is_iap2_detection_response(&IAP2_DETECTION_SEQUENCE));
-	}
-
-	#[test]
-	fn identifies_iap1_probe_responses() {
-		assert!(is_iap1_detection_response(&[0x55, 0x02, 0x00, 0x00, 0xfe]));
-		assert!(is_iap1_detection_response(&[
-			0xff, 0x55, 0x04, 0x00, 0x02, 0x04, 0xee, 0x08,
-		]));
-	}
-}
+pub use hid::{INPUT_REPORT_SIZES, MAX_INPUT_CHUNK, Reassembler, wrap_input};
+pub use link::{Frame, Link, LinkOutput, LinkSync, Session, parse_set};
+pub use packet::{Control, DETECTION, LinkPacket, ParseError, checksum};

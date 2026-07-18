@@ -612,6 +612,7 @@ dependencies = [
  "proc-mounts",
  "rustix",
  "strum",
+ "tokio",
  "uuid",
 ]
 
