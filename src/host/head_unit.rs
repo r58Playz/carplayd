@@ -14,10 +14,10 @@ use nusb::{Device, DeviceInfo, list_devices};
 use crate::iap2::transport::bulk::{IAP2_INTERFACE, NCM_CONTROL_INTERFACE, NCM_DATA_INTERFACE};
 
 /// The head unit, once enumerated.
+#[derive(Clone)]
 pub struct HeadUnit {
 	pub device: Device,
-	pub vendor_id: u16,
-	pub product_id: u16,
+	pub device_info: DeviceInfo,
 	pub iap2_interface: u8,
 	pub ncm_control_interface: u8,
 	pub ncm_data_interface: u8,
@@ -39,10 +39,10 @@ pub async fn find_iap2_device(attempts: u32, interval: Duration) -> Result<HeadU
 
 		debug!("attempt {attempt}: {} USB device(s)", devices.len());
 
-		let found = devices.iter().find_map(|d| {
-			interface_matching(d, IAP2_INTERFACE)
-				.zip(interface_matching(d, NCM_CONTROL_INTERFACE))
-				.zip(interface_matching(d, NCM_DATA_INTERFACE))
+		let found = devices.into_iter().find_map(|d| {
+			interface_matching(&d, IAP2_INTERFACE)
+				.zip(interface_matching(&d, NCM_CONTROL_INTERFACE))
+				.zip(interface_matching(&d, NCM_DATA_INTERFACE))
 				.map(|((a, b), c)| (d, a, b, c))
 		});
 
@@ -55,8 +55,7 @@ pub async fn find_iap2_device(attempts: u32, interval: Duration) -> Result<HeadU
 
 			return Ok(HeadUnit {
 				device: info.open().await.context("failed to open iAP2 device")?,
-				vendor_id: info.vendor_id(),
-				product_id: info.product_id(),
+				device_info: info,
 				iap2_interface,
 				ncm_control_interface,
 				ncm_data_interface,

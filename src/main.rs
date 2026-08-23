@@ -5,12 +5,22 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use log::{LevelFilter, debug, info, warn};
-use tokio::task::spawn_blocking;
+use mdns_sd::{IfKind, ServiceDaemon};
+use tokio::{
+	sync::mpsc,
+	task::{JoinSet, spawn_blocking},
+	time::timeout,
+};
 
 use crate::{
 	dwc2::{Dwc2, Mode},
 	gadget::{run_gadget, udc_name},
-	host::head_unit::{HeadUnit, find_iap2_device},
+	host::{
+		head_unit::{HeadUnit, find_iap2_device},
+		mdns_client::find_head_unit_server,
+		mdns_server::CarplayCtrlServer,
+		ncm::{configure_ncm, get_ncm_device_name},
+	},
 	iap2::{
 		ControlSession, DefaultPolicy, DeviceProfile, Handshake, Link, LinkParams, MAX_PACKET_LEN,
 		Role, policy, transport::bulk,
@@ -31,17 +41,7 @@ async fn force_mode(dwc2: &Arc<Dwc2>, mode: Mode) -> Result<()> {
 	spawn_blocking(move || dwc2.force_mode(mode)).await?
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-	env_logger::builder()
-		.filter_level(LevelFilter::Warn)
-		.filter_module("carplayd", LevelFilter::Trace)
-		.format_timestamp_millis()
-		.parse_default_env()
-		.init();
-
-	let sn = std::env::args().nth(1).context("no serial provided")?;
-
+async fn run_usb_handshake(sn: &str) -> Result<HeadUnit> {
 	let controller_name = spawn_blocking(udc_name)
 		.await?
 		.context("failed to get controller name")?;
@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
 		.await
 		.context("failed to force controller into gadget mode")?;
 
-	let (gadget, success) = run_gadget(&sn).await.context("failed to run gadget")?;
+	let (gadget, success) = run_gadget(sn).await.context("failed to run gadget")?;
 	if !success? {
 		bail!("iAP2 accessory rejected us");
 	}
@@ -83,6 +83,10 @@ async fn main() -> Result<()> {
 
 	gadget.remove().context("failed to remove gadget")?;
 
+	Ok(head_unit)
+}
+
+async fn run_usb_iap2(head_unit: HeadUnit) -> Result<()> {
 	let transport = bulk::open(&head_unit.device, head_unit.iap2_interface, MAX_PACKET_LEN)
 		.await
 		.context("failed to open the iAP2 bulk transport")?;
@@ -93,31 +97,22 @@ async fn main() -> Result<()> {
 
 	info!(
 		"iAP2 over bulk with {:04x}:{:04x}; waiting for the accessory's detection sequence",
-		head_unit.vendor_id, head_unit.product_id
+		head_unit.device_info.vendor_id(),
+		head_unit.device_info.product_id()
 	);
 	let result = policy::drive(&mut session, &mut handshake, |h, params| {
 		info!("iAP2 control session ready over {params:?}");
-		let ncm = (
-			head_unit.ncm_control_interface,
-			head_unit.ncm_data_interface,
-		);
+		let control = head_unit.ncm_control_interface;
+		let data = head_unit.ncm_data_interface;
 		match h.carplay_interface() {
 			// The nominated number must be the NCM control interface (Table 30-1).
-			Some(nominated) if nominated == ncm.0 => {
-				info!(
-					"CarPlay rides on NCM control interface {nominated}, data {:?}",
-					ncm.1
-				)
+			Some(nominated) if nominated == control => {
+				info!("accessory nominated {nominated} (matches control), data {data}")
 			}
 			Some(nominated) => warn!(
-				"accessory nominated CarPlay interface {nominated} but its NCM interfaces \
-				 are control {} / data {}",
-				ncm.0, ncm.1
+				"accessory nominated {nominated} but its NCM interfaces are control {control} / data {data}",
 			),
-			None => warn!(
-				"accessory did not nominate a CarPlay interface in its \
-				 USBHostTransportComponent"
-			),
+			None => warn!("accessory did not nominate a NCM interface"),
 		}
 	})
 	.await;
@@ -125,4 +120,71 @@ async fn main() -> Result<()> {
 	Err(result
 		.expect_err("policy::drive only returns on failure")
 		.into())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+	env_logger::builder()
+		.filter_level(LevelFilter::Warn)
+		.filter_module("carplayd", LevelFilter::Trace)
+		.format_timestamp_millis()
+		.parse_default_env()
+		.init();
+
+	let sn = std::env::args().nth(1).context("no serial provided")?;
+
+	let mut set = JoinSet::new();
+
+	let mdns = ServiceDaemon::new().context("failed to create mdns server")?;
+	mdns.disable_interface(IfKind::All)
+		.context("failed to blacklist all interfaces")?;
+
+	let head_unit = run_usb_handshake(&sn)
+		.await
+		.context("failed to run usb handshake")?;
+
+	let net_iface = get_ncm_device_name(&head_unit)
+		.await
+		.context("failed to get ncm device name")?;
+	let (ip, scope_id) = configure_ncm(&net_iface)
+		.await
+		.context("failed to configure ncm device")?;
+
+	mdns.enable_interface(&net_iface)
+		.context("failed to enable ncm device for mdns")?;
+
+	let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+	set.spawn(
+		CarplayCtrlServer {
+			conn_tx,
+			mdns: mdns.clone(),
+			ip,
+			scope_id,
+			port: 6767,
+		}
+		.run(),
+	);
+	set.spawn(run_usb_iap2(head_unit.clone()));
+
+	let target_mac = timeout(Duration::from_millis(500), conn_rx.recv())
+		.await
+		.ok()
+		.flatten();
+	set.spawn(async move {
+		while let Some(addr) = conn_rx.recv().await {
+			warn!("got carplay-ctrl connect addr late {addr:?}");
+		}
+		Ok(())
+	});
+	if target_mac.is_none() {
+		warn!("carplay-ctrl timed out");
+	}
+
+	let head_unit_server = find_head_unit_server(mdns, target_mac, scope_id)
+		.await
+		.context("failed to find head unit server")?;
+
+	set.join_all().await;
+
+	Ok(())
 }
