@@ -1,47 +1,50 @@
 use anyhow::{Context, Result, anyhow};
-use log::{debug, trace};
+use log::{debug, info, trace, warn};
 use tokio::{sync::mpsc, task::JoinSet};
 use usb_gadget::{
-	Class, Config, Gadget, Id, Strings, UsbVersion, default_udc,
+	Class, Config, Gadget, Id, RegGadget, Strings, UsbVersion, default_udc,
 	function::custom::{
-		Custom, CustomBuilder, CustomDesc, Endpoint, EndpointDirection, EndpointSender, Event,
-		Interface, TransferType,
+		CtrlReceiver, CtrlSender, Custom, CustomBuilder, CustomDesc, Endpoint, EndpointDirection,
+		EndpointSender, Event, Interface, TransferType,
 	},
 };
 
-use crate::iap2::{Link, msg};
+use crate::iap2::{
+	ControlSession, DeviceProfile, Error, Handshake, Link, LinkParams, Role, policy,
+	transport::hid::{HidTransport, output_report_size, zeroed_input_report},
+};
 
 const D2H_VENDOR_TYPE: u8 = 0xc0;
 const H2D_VENDOR_TYPE: u8 = 0x40;
 
 const APPLE_GET_CAPABILITIES: u8 = 0x53;
 const APPLE_USB_ROLE_SWITCH: u8 = 0x51;
+/// `wValue` for a role switch into CarPlay (Table 60-4).
+const APPLE_CAPABILITY_CARPLAY: u16 = 0x0001;
 
-// ── iAP2-over-HID (USB Device Mode) control-request plumbing (spec §60.5.5) ──
-// Request-type bytes for the HID class/standard interface requests the car issues
-// while the Pi is still the USB *device*.
-const D2H_STD_IFACE: u8 = 0x81; // dir in  | standard | interface
-const H2D_CLASS_IFACE: u8 = 0x21; // dir out | class    | interface
+const D2H_STD_IFACE: u8 = 0x81;
+const H2D_CLASS_IFACE: u8 = 0x21;
+const D2H_CLASS_IFACE: u8 = 0xa1;
 
 const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
-const HID_DESCRIPTOR_TYPE: u8 = 0x21; // GET_DESCRIPTOR wValue high byte / CustomDesc type
-const HID_REPORT_DESC_TYPE: u8 = 0x22; // GET_DESCRIPTOR wValue high byte for the report descriptor
+const HID_DESCRIPTOR_TYPE: u8 = 0x21;
+const HID_REPORT_DESC_TYPE: u8 = 0x22;
+const HID_REQ_GET_REPORT: u8 = 0x01;
+const HID_REQ_GET_IDLE: u8 = 0x02;
+const HID_REQ_GET_PROTOCOL: u8 = 0x03;
 const HID_REQ_SET_REPORT: u8 = 0x09;
 const HID_REQ_SET_IDLE: u8 = 0x0a;
+/// `wValue` high byte for an Input report (HID 1.11 §7.2.1).
+const HID_REPORT_TYPE_INPUT: u8 = 0x01;
 
-/// HID class descriptor payload (the 7 bytes after `bLength`/`bDescriptorType`):
-/// bcdHID 1.11, no country code, one report descriptor of 208 bytes. Injected into
-/// the interface with [`CustomDesc`] so it lands between the interface and endpoint
-/// descriptors, and served verbatim for a `GET_DESCRIPTOR(0x21)`.
+/// The `USBTransportIdentifier` we report before the role switch. It only has to be
+/// something the accessory can compare against its wireless sessions, of which a wired
+/// head unit has none.
+const USB_TRANSPORT_IDENTIFIER: &str = "usb0";
+
+/// iAP2-over-HID report descriptor, captured verbatim from a real iPhone
 const HID_DESC_DATA: [u8; 7] = [0x11, 0x01, 0x00, 0x01, 0x22, 0xd0, 0x00];
-/// Full 9-byte HID class descriptor (`bLength`, `bDescriptorType`, then [`HID_DESC_DATA`]).
 const HID_DESC_FULL: [u8; 9] = [0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0xd0, 0x00];
-
-/// iAP2-over-HID report descriptor, captured verbatim from a real iPhone (208 bytes,
-/// matching `wDescriptorLength 208`). Input reports 1..=12 (5..=767 B payload) carry
-/// phone→car iAP data over the interrupt IN endpoint; Output reports 13..=21
-/// (5..=255 B) carry car→phone iAP data via EP0 `SET_REPORT`. Each report payload is
-/// `[Link Control Byte][iAP packet data]`, zero-padded to the report size (§60.5.6).
 #[rustfmt::skip]
 const HID_REPORT_DESC: [u8; 208] = [
 	0x06, 0x00, 0xff,       // Usage Page (Vendor-Defined 0xFF00)
@@ -90,16 +93,9 @@ fn custom_builder() -> CustomBuilder {
 	builder
 }
 
-/// Returns a Gadget that mimics the iPhone USB descriptor dump plus the four
-/// `Custom` functions (one per configuration) whose control channels must be
-/// driven. The car selects one configuration, and only that configuration's
-/// function receives the vendor setup requests — so all four are returned and
-/// polled together in `run_gadget`.
 pub fn iphone_gadget(sn: &str) -> (Gadget, Vec<Custom>, EndpointSender) {
 	let mut customs = Vec::new();
 
-	// ── Config 1: "PTP" ───────────────────────────────────────────────────────
-	// Interface 0: Still Image Capture, class 6/1/1, bulk OUT + bulk IN.
 	let (_ep1_rx, ep1_dir) = EndpointDirection::host_to_device();
 	let (_ep2_tx, ep2_dir) = EndpointDirection::device_to_host();
 	let (custom1, handle1) = custom_builder()
@@ -114,11 +110,10 @@ pub fn iphone_gadget(sn: &str) -> (Gadget, Vec<Custom>, EndpointSender) {
 	config1.max_power = 500;
 	config1.self_powered = true;
 
-	// ── Config 2: "iPod USB Interface" — iAP2-over-HID transport ─────────────
 	let (hid_tx, hid_dir) = EndpointDirection::device_to_host();
 	let mut hid_ep = Endpoint::custom(hid_dir, TransferType::Interrupt);
-	hid_ep.max_packet_size_hs = 64; // matches the real iPhone's 0x83 interrupt IN
-	hid_ep.interval = 1; // 125 µs at high speed, as the iPhone advertises
+	hid_ep.max_packet_size_hs = 64;
+	hid_ep.interval = 1;
 	let (custom2, handle2) = custom_builder()
 		.with_interface(
 			Interface::new(Class::new(0x03, 0x00, 0x00), "iAP HID")
@@ -131,8 +126,6 @@ pub fn iphone_gadget(sn: &str) -> (Gadget, Vec<Custom>, EndpointSender) {
 	config2.max_power = 500;
 	config2.self_powered = true;
 
-	// ── Config 3: "PTP + Apple Mobile Device" ────────────────────────────────
-	// Interface 0: PTP.  Interface 1: Apple USB Multiplexor (usbmux).
 	let (_ep4_rx, ep4_dir) = EndpointDirection::host_to_device();
 	let (_ep5_tx, ep5_dir) = EndpointDirection::device_to_host();
 	let (_ep6_rx, ep6_dir) = EndpointDirection::host_to_device();
@@ -154,8 +147,6 @@ pub fn iphone_gadget(sn: &str) -> (Gadget, Vec<Custom>, EndpointSender) {
 	config3.max_power = 500;
 	config3.self_powered = true;
 
-	// ── Config 4: "PTP + Apple Mobile Device + Apple USB Ethernet" ───────────
-	// Interface 0: PTP.  Interface 1: Apple USB Multiplexor.  Interface 2: NCM.
 	let (_ep8_rx, ep8_dir) = EndpointDirection::host_to_device();
 	let (_ep9_tx, ep9_dir) = EndpointDirection::device_to_host();
 	let (_ep10_rx, ep10_dir) = EndpointDirection::host_to_device();
@@ -185,25 +176,35 @@ pub fn iphone_gadget(sn: &str) -> (Gadget, Vec<Custom>, EndpointSender) {
 	config4.max_power = 500;
 	config4.self_powered = true;
 
-	// ── Gadget ────────────────────────────────────────────────────────────────
 	let mut gadget = Gadget::new(
-		Class::new(0x00, 0x00, 0x00), // per §60.4 the device class must be 0x00
+		Class::new(0x00, 0x00, 0x00),
 		Id::new(0x05ac, 0x12a8),
 		Strings::new("Apple Inc.", "iPhone", sn),
 	)
-	.with_config(config1) // bConfigurationValue 1
-	.with_config(config2) // bConfigurationValue 2
-	.with_config(config3) // bConfigurationValue 3
-	.with_config(config4); // bConfigurationValue 4
+	.with_config(config1)
+	.with_config(config2)
+	.with_config(config3)
+	.with_config(config4);
 
-	gadget.device_release = 0x1002; // bcdDevice 16.02
-	gadget.usb_version = UsbVersion::V20; // bcdUSB 2.00
+	gadget.device_release = 0x1002;
+	gadget.usb_version = UsbVersion::V20;
 	gadget.max_packet_size0 = 64;
 
 	(gadget, customs, hid_tx)
 }
 
-pub async fn run_gadget(sn: &str) -> Result<bool> {
+pub struct GadgetGuard(RegGadget);
+impl GadgetGuard {
+	pub fn unbind(&self) -> Result<(), std::io::Error> {
+		self.0.bind(None)
+	}
+
+	pub fn remove(self) -> Result<(), std::io::Error> {
+		self.0.remove()
+	}
+}
+
+pub async fn run_gadget(sn: &str) -> Result<(GadgetGuard, Result<bool>)> {
 	usb_gadget::remove_all().context("failed to remove usb gadgets")?;
 
 	let udc = default_udc().context("failed to get default udc")?;
@@ -214,149 +215,56 @@ pub async fn run_gadget(sn: &str) -> Result<bool> {
 
 	let mut set = JoinSet::new();
 
-	let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+	let (report_tx, report_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+	let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
 	set.spawn(async move {
-		let mut link = Link::new();
-		while let Some(bytes) = rx.recv().await {
-			let out = link.receive(&bytes);
-			for report in out.reports {
-				hid_tx
-					.send_async(report.into())
-					.await
-					.context("failed to send HID input report")?;
-			}
-			if out.established {
-				debug!(
-					"iAP2 link established (control session {:?})",
-					link.control_session()
-				);
-				for r in link.send_control(msg::REQUEST_AUTH_CERTIFICATE.to_vec()) {
-					hid_tx.send_async(r.into()).await?;
-				}
-			}
-			for (session, payload) in out.payloads {
-				debug!(
-					"iAP2 session {session} payload ({} bytes): {:02x?}",
-					payload.len(),
-					payload
-				);
-
-				let (next, optional_next) = match msg::message_id(&payload) {
-					Some(msg::ID_AUTHENTICATION_CERTIFICATE) => {
-						(msg::request_auth_challenge_response(&msg::CHALLENGE), None)
-					}
-					Some(msg::ID_AUTHENTICATION_RESPONSE) => (
-						msg::AUTHENTICATION_SUCCEEDED.to_vec(),
-						Some(msg::START_IDENTIFICATION.to_vec()),
-					),
-					Some(msg::ID_IDENTIFICATION_INFORMATION) => (
-						msg::IDENTIFICATION_ACCEPTED.to_vec(),
-						Some(msg::device_transport_identifier("usb0")),
-					),
-					_ => continue,
-				};
-
-				for r in link.send_control(next) {
-					hid_tx.send_async(r.into()).await?;
-				}
-				if let Some(next) = optional_next {
-					for r in link.send_control(next) {
-						hid_tx.send_async(r.into()).await?;
-					}
-				}
-			}
+		while let Some(report) = input_rx.recv().await {
+			hid_tx
+				.send_async(report.into())
+				.await
+				.context("failed to send HID input report")?;
 		}
-		debug!("hid task ended");
+		debug!("HID input writer ended");
+		anyhow::Ok(false)
+	});
+
+	set.spawn(async move {
+		let transport = HidTransport::new(report_rx, input_tx);
+		let link = Link::new(transport, Role::Device, LinkParams::usb_recommended());
+		let mut session = ControlSession::new(link);
+		let mut handshake = Handshake::new(DeviceProfile {
+			usb_transport_identifier: Some(USB_TRANSPORT_IDENTIFIER.into()),
+			..DeviceProfile::default()
+		});
+
+		match policy::drive(&mut session, &mut handshake, |h, params| {
+			info!("iAP2 ready over HID: {params:?}");
+			if let Some(iface) = h.carplay_interface() {
+				info!("accessory nominated CarPlay interface {iface}");
+			}
+		})
+		.await
+		{
+			Err(Error::Closed) => debug!("iAP2 over HID ended with the transport"),
+			Err(err) => warn!("iAP2 over HID failed: {err}"),
+			Ok(()) => {}
+		}
 		anyhow::Ok(false)
 	});
 
 	for (idx, mut custom) in customs.into_iter().enumerate() {
 		let config = idx + 1;
-		let tx = tx.clone();
+		let report_tx = report_tx.clone();
 		set.spawn(async move {
 			'outer: loop {
 				custom.wait_event().await?;
 				while let Some(event) = custom.try_event()? {
 					match event {
-						Event::SetupDeviceToHost(req) => {
-							trace!("config {config} data request: {:?}", req);
-							if req.ctrl_req().request_type == D2H_VENDOR_TYPE
-								&& req.ctrl_req().request == APPLE_GET_CAPABILITIES
-								&& req.len() == 4
-							{
-								debug!("gadget received apple get supported capabilities");
-								req.send(&[0x01, 0x00, 0x00, 0x00]) // carplay
-									.context("failed to send carplay capability back")?;
-							} else if req.ctrl_req().request_type == D2H_STD_IFACE
-								&& req.ctrl_req().request == USB_REQ_GET_DESCRIPTOR
-							{
-								let desc_type = (req.ctrl_req().value >> 8) as u8;
-								let want = req.len();
-								match desc_type {
-									HID_REPORT_DESC_TYPE => {
-										let n = want.min(HID_REPORT_DESC.len());
-										debug!(
-											"config {config} sending HID report descriptor ({n} bytes)"
-										);
-										req.send(&HID_REPORT_DESC[..n])
-											.context("failed to send HID report descriptor")?;
-									}
-									HID_DESCRIPTOR_TYPE => {
-										let n = want.min(HID_DESC_FULL.len());
-										debug!("config {config} sending HID descriptor");
-										req.send(&HID_DESC_FULL[..n])
-											.context("failed to send HID descriptor")?;
-									}
-									other => {
-										trace!(
-											"config {config} unhandled GET_DESCRIPTOR 0x{other:02x}"
-										)
-									}
-								}
-							}
-						}
+						Event::SetupDeviceToHost(req) => on_setup_in(config, req)?,
 						Event::SetupHostToDevice(req) => {
-							trace!("config {config} data sent: {:?}", req);
-							if req.ctrl_req().request_type == H2D_VENDOR_TYPE
-								&& req.ctrl_req().request == APPLE_USB_ROLE_SWITCH
-								&& req.is_empty()
-							{
-								debug!("gadget received apple usb role switch");
-								req.recv_all()
-									.context("failed to ack role switch request")?;
+							if on_setup_out(config, req, &report_tx)? {
 								break 'outer anyhow::Ok(true);
-							} else if req.ctrl_req().request_type == H2D_VENDOR_TYPE {
-								debug!(
-									"acking apple vendor request 0x{:02x}",
-									req.ctrl_req().request
-								);
-								let _ = req.recv_all();
-							} else if req.ctrl_req().request_type == H2D_CLASS_IFACE {
-								match req.ctrl_req().request {
-									HID_REQ_SET_REPORT => {
-										let report_id = (req.ctrl_req().value & 0xff) as u8;
-										let data = req
-											.recv_all()
-											.context("failed to recv HID SET_REPORT")?;
-										debug!(
-											"config {config} HID SET_REPORT id={report_id} ({} bytes): {:02x?}",
-											data.len(),
-											data
-										);
-										tx.send(data).context("failed to send to hid task")?;
-									}
-									HID_REQ_SET_IDLE => {
-										let _ = req.recv_all(); // no data phase; ACK
-										trace!("config {config} HID SET_IDLE");
-									}
-									other => {
-										trace!(
-											"config {config} unhandled HID class request 0x{other:02x}"
-										);
-										let _ = req.recv_all();
-									}
-								}
 							}
 						}
 						Event::Enable => debug!("gadget enabled: car selected config {config}"),
@@ -369,6 +277,7 @@ pub async fn run_gadget(sn: &str) -> Result<bool> {
 			}
 		});
 	}
+	drop(report_tx);
 
 	let ret = match set
 		.join_next()
@@ -377,10 +286,171 @@ pub async fn run_gadget(sn: &str) -> Result<bool> {
 		.context("failed to join task")?
 	{
 		Ok(true) => Ok(true),
-		Ok(false) => Err(anyhow!("hid task failed")),
+		Ok(false) => Err(anyhow!("gadget task ended before the role switch")),
 		Err(err) => Err(err),
 	};
-	reg.remove().context("failed to remove gadget")?;
-	set.abort_all();
-	ret
+
+	Ok((GadgetGuard(reg), ret))
+}
+
+/// The setup-packet fields we branch on, copied out so the request itself stays movable
+/// (answering it consumes the [`CtrlSender`] / [`CtrlReceiver`]).
+#[derive(Clone, Copy, Debug)]
+struct Setup {
+	request_type: u8,
+	request: u8,
+	value: u16,
+}
+
+impl Setup {
+	fn of(req: &usb_gadget::function::custom::CtrlReq) -> Self {
+		Self {
+			request_type: req.request_type,
+			request: req.request,
+			value: req.value,
+		}
+	}
+}
+
+/// Answer a device-to-host control request.
+///
+/// Every path must either `send` or `halt`: dropping a [`CtrlSender`] stalls EP0, which is
+/// how twelve unanswered `GET_REPORT`s used to turn into twelve silent EP0 halts.
+fn on_setup_in(config: usize, req: CtrlSender<'_>) -> Result<()> {
+	trace!("config {config} data request: {:?}", req.ctrl_req());
+	let ctrl = Setup::of(req.ctrl_req());
+
+	match (ctrl.request_type, ctrl.request) {
+		(D2H_VENDOR_TYPE, APPLE_GET_CAPABILITIES) if req.len() == 4 => {
+			debug!("gadget received apple get supported capabilities");
+			// Little-endian wValue bitfield then wIndex (Tables 60-3, 60-4).
+			req.send(&[0x01, 0x00, 0x00, 0x00])
+				.context("failed to send carplay capability back")?;
+		}
+		(D2H_STD_IFACE, USB_REQ_GET_DESCRIPTOR) => {
+			let desc_type = (ctrl.value >> 8) as u8;
+			let want = req.len();
+			match desc_type {
+				HID_REPORT_DESC_TYPE => {
+					let n = want.min(HID_REPORT_DESC.len());
+					debug!("config {config} sending HID report descriptor ({n} bytes)");
+					req.send(&HID_REPORT_DESC[..n])
+						.context("failed to send HID report descriptor")?;
+				}
+				HID_DESCRIPTOR_TYPE => {
+					let n = want.min(HID_DESC_FULL.len());
+					debug!("config {config} sending HID descriptor");
+					req.send(&HID_DESC_FULL[..n])
+						.context("failed to send HID descriptor")?;
+				}
+				other => {
+					trace!("config {config} stalling GET_DESCRIPTOR 0x{other:02x}");
+					req.halt().context("failed to stall GET_DESCRIPTOR")?;
+				}
+			}
+		}
+		(D2H_CLASS_IFACE, HID_REQ_GET_REPORT) => {
+			// The car polls every Input report id during enumeration. A real iPhone
+			// answers; we have nothing queued, and an all-zero report is a well-formed
+			// empty report set (LCB 0, no link packet), so zeros are the honest reply.
+			// The data phase carries no report-id byte -- it is in wValue, exactly as for
+			// SET_REPORT.
+			let report_type = (ctrl.value >> 8) as u8;
+			let report_id = (ctrl.value & 0xff) as u8;
+			match zeroed_input_report(report_id, req.len())
+				.filter(|_| report_type == HID_REPORT_TYPE_INPUT)
+			{
+				Some(data) => {
+					debug!(
+						"config {config} HID GET_REPORT id={report_id} -> {} zero bytes",
+						data.len()
+					);
+					req.send(&data).context("failed to send HID input report")?;
+				}
+				None => {
+					trace!(
+						"config {config} stalling HID GET_REPORT type={report_type} id={report_id}"
+					);
+					req.halt().context("failed to stall HID GET_REPORT")?;
+				}
+			}
+		}
+		(D2H_CLASS_IFACE, HID_REQ_GET_IDLE | HID_REQ_GET_PROTOCOL) => {
+			trace!("config {config} HID class request 0x{:02x}", ctrl.request);
+			req.send(&[0x00])
+				.context("failed to answer HID class request")?;
+		}
+		_ => {
+			trace!("config {config} stalling unhandled data request: {ctrl:?}");
+			req.halt().context("failed to stall control request")?;
+		}
+	}
+	Ok(())
+}
+
+/// Answer a host-to-device control request. Returns `true` when the car asked for the USB
+/// role switch, which ends the gadget phase.
+fn on_setup_out(
+	config: usize,
+	req: CtrlReceiver<'_>,
+	reports: &mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<bool> {
+	trace!("config {config} data sent: {:?}", req.ctrl_req());
+	let ctrl = Setup::of(req.ctrl_req());
+
+	match (ctrl.request_type, ctrl.request) {
+		(H2D_VENDOR_TYPE, APPLE_USB_ROLE_SWITCH) if req.is_empty() => {
+			if ctrl.value != APPLE_CAPABILITY_CARPLAY {
+				// Table 60-5 carries the capability being switched into in wValue. Anything
+				// else is not a CarPlay switch, so note it rather than silently obeying.
+				warn!(
+					"role switch requested for wValue {:#06x}, not CarPlay",
+					ctrl.value
+				);
+			}
+			debug!("gadget received apple usb role switch");
+			req.recv_all()
+				.context("failed to ack role switch request")?;
+			return Ok(true);
+		}
+		(H2D_VENDOR_TYPE, other) => {
+			debug!("acking apple vendor request 0x{other:02x}");
+			req.recv_all()
+				.context("failed to ack apple vendor request")?;
+		}
+		(H2D_CLASS_IFACE, HID_REQ_SET_REPORT) => {
+			let report_id = (ctrl.value & 0xff) as u8;
+			let data = req.recv_all().context("failed to recv HID SET_REPORT")?;
+			debug!(
+				"config {config} HID SET_REPORT id={report_id} ({} bytes)",
+				data.len()
+			);
+			if let Some(expected) = output_report_size(report_id)
+				&& data.len() != expected
+			{
+				// Not fatal: the LCB says how much of the report is real. Worth knowing,
+				// because it means the car is not using the descriptor we published.
+				warn!(
+					"HID SET_REPORT id={report_id} carried {} bytes, descriptor declares {expected}",
+					data.len()
+				);
+			}
+			reports
+				.send(data)
+				.context("failed to send to the iAP2 task")?;
+		}
+		(H2D_CLASS_IFACE, HID_REQ_SET_IDLE) => {
+			req.recv_all().context("failed to ack HID SET_IDLE")?;
+			trace!("config {config} HID SET_IDLE");
+		}
+		(H2D_CLASS_IFACE, other) => {
+			trace!("config {config} unhandled HID class request 0x{other:02x}");
+			req.halt().context("failed to stall HID class request")?;
+		}
+		_ => {
+			trace!("config {config} stalling unhandled request: {ctrl:?}");
+			req.halt().context("failed to stall control request")?;
+		}
+	}
+	Ok(false)
 }

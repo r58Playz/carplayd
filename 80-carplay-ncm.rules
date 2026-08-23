@@ -1,0 +1,1 @@
+ACTION=="add|change", SUBSYSTEM=="net", ENV{ID_NET_DRIVER}=="cdc_ncm", ENV{NM_UNMANAGED}="1"

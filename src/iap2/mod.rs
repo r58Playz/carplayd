@@ -1,46 +1,59 @@
-//! Minimal iAP2 implementation for faking an iPhone (the *device*) to a CarPlay
-//! head unit over the USB Device Mode HID transport.
+//! iAP2, from the wire up, for impersonating an iPhone to a CarPlay head unit.
 //!
-//! This is the mechanical link layer only — the parts that are identical for every
-//! connection yet cannot be hardcoded, because they depend on the car's random,
-//! per-packet sequence numbers and checksums:
+//! The stack is four layers, each a `Stream`/`Sink` over the one below, so the transport
+//! is interchangeable — the same link and session code runs over HID reports before the
+//! USB role switch and over bulk pipes after it:
 //!
-//! - [`packet`]: the link-packet wire codec (framing + checksums) and [`Control`] bits.
-//! - [`Link`]: the link-layer driver — runs the detection/`SYN`/`SYN+ACK`/establish
-//!   handshake, tracks sequence & acknowledgement numbers, auto-acks inbound data,
-//!   and does the HID (de)framing for the USB Device Mode transport.
-//! - Lower-level pieces are exported too ([`wrap_input`], [`Reassembler`],
-//!   [`parse_set`], [`LinkSync`]) for debugging or bespoke handling.
-//!
-//! It intentionally omits everything that is *policy*: which control-session
-//! messages to send and when, and their contents (authentication is accept-only,
-//! identification, `DeviceTransportIdentifierNotification`, …). Drive that on top.
-//!
-//! # Usage — you only touch payloads
-//! Hold one [`Link`] in config 2's task. In the EP0 `SET_REPORT` handler:
-//! ```ignore
-//! let out = link.receive(&set_report_data); // the recv_all() bytes
-//! for report in out.reports {
-//!     hid_tx.send_async(report.into()).await?; // detection echo / SYN+ACK / ACKs
-//! }
-//! if out.established {
-//!     // device drives auth: send RequestAuthenticationCertificate first
-//!     for report in link.send_control(request_auth_certificate()) {
-//!         hid_tx.send_async(report.into()).await?;
-//!     }
-//! }
-//! for (session, payload) in out.payloads {
-//!     // your script: pick the next message from what the car sent, then
-//!     // link.send_control(next_message()) and write the reports.
-//! }
+//! ```text
+//! policy::Policy            what to send and when: authenticate, identify, answer
+//! session::ControlSession   Stream<Item = ControlEvent> + Sink<Message>   (§56.3.2)
+//! link::Link                Stream<Item = LinkEvent>   + Sink<(session, payload)> (§56.2)
+//! transport::{bulk, hid}    Stream<Item = Frame>       + Sink<Frame>
 //! ```
-#![allow(dead_code, unused_imports)] // the message-script layer that consumes this is written separately
+//!
+//! - [`packet`] is the §56.2 wire codec: [`LinkPacket`], [`Control`], and [`LinkCodec`],
+//!   which resynchronizes to the next start-of-packet marker instead of failing.
+//! - [`sync`] is the Link Synchronization Payload and the parameters it negotiates.
+//! - [`link`] is the §56.2.7 operation record — sequence numbers, the send window,
+//!   retransmission, cumulative and extended acknowledgements — as a pure state machine
+//!   plus a `Stream`/`Sink` wrapper that owns the timers.
+//! - [`msg`] decodes and encodes control-session messages, including group parameters,
+//!   and carries the generated §97 identifier table.
+//! - [`session`] filters the link down to the control session.
+//! - [`policy`] is the device half of the handshake: accept-only authentication,
+//!   identification, and the notifications a device sends unprompted. The mechanical part
+//!   is [`Handshake`]; what to answer above it is the [`Policy`] trait, whose methods all
+//!   have defaults so each side implements only what it needs.
+//!
+//! # Usage
+//! ```ignore
+//! let transport = transport::bulk::open(&device, iap2_interface, MAX_PACKET_LEN).await?;
+//! let link = Link::new(transport, Role::Device, LinkParams::usb_recommended());
+//! let mut session = ControlSession::new(link);
+//! let mut handshake = Handshake::new(DeviceProfile::default());
+//! policy::drive(&mut session, &mut handshake, |h, params| {
+//!     info!("iAP2 ready over {params:?}; CarPlay interface {:?}", h.carplay_interface());
+//! })
+//! .await
+//! ```
 
-mod hid;
-mod link;
+// `carplayd` is a binary, so nothing outside it consumes this module's API and the
+// compiler cannot see the unit tests that do. Everything here is either used by the
+// binary, exercised by tests, or a documented part of the protocol surface.
+#![allow(dead_code)]
+
+pub mod error;
+pub mod link;
 pub mod msg;
-mod packet;
+pub mod packet;
+pub mod policy;
+pub mod session;
+pub mod sync;
+pub mod transport;
 
-pub use hid::{INPUT_REPORT_SIZES, MAX_INPUT_CHUNK, Reassembler, wrap_input};
-pub use link::{Frame, Link, LinkOutput, LinkSync, Session, parse_set};
-pub use packet::{Control, DETECTION, LinkPacket, ParseError, checksum};
+pub use error::Error;
+pub use link::{Link, Role};
+pub use packet::MAX_PACKET_LEN;
+pub use policy::{DefaultPolicy, DeviceProfile, Handshake};
+pub use session::ControlSession;
+pub use sync::LinkParams;
