@@ -12,7 +12,7 @@ use tokio::{
 use crate::{
 	carplay::{
 		ctrl_server::CarplayCtrlServer,
-		head_unit_discover::find_head_unit_server,
+		net::head_unit::find_head_unit_server,
 		usb::{
 			dwc2::{Dwc2, Mode},
 			head_unit::{HeadUnitUsb, find_iap2_device},

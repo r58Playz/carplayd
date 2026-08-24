@@ -9,7 +9,7 @@ use tokio::{net::TcpStream, select};
 use tokio_util::either::Either;
 
 use crate::{
-	carplay::codec::{Transport, secure},
+	carplay::net::codec::{Transport, secure},
 	pairing::{
 		auth_setup::{AccessoryAuth, AuthSetup},
 		identity::Identity,
