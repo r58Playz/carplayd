@@ -209,7 +209,10 @@ mod tests {
 
 	/// The accessory's encoder uses our read key, and vice versa.
 	fn peer(keys: SessionKeys) -> (ControlEncoder, ControlDecoder) {
-		(ControlEncoder::new(&keys.read), ControlDecoder::new(&keys.write))
+		(
+			ControlEncoder::new(&keys.read),
+			ControlDecoder::new(&keys.write),
+		)
 	}
 
 	#[test]
@@ -218,7 +221,9 @@ mod tests {
 		let mut encoder = ControlEncoder::new(&keys.write);
 		let mut buf = BytesMut::new();
 
-		encoder.encode(b"RTSP/1.0 200 OK".as_slice(), &mut buf).unwrap();
+		encoder
+			.encode(b"RTSP/1.0 200 OK".as_slice(), &mut buf)
+			.unwrap();
 
 		assert_eq!(buf.len(), 15 + OVERHEAD);
 		assert_eq!(u16::from_le_bytes([buf[0], buf[1]]) as usize, 15);
@@ -271,7 +276,10 @@ mod tests {
 		assert!(decoder.decode(&mut partial).unwrap().is_none());
 
 		partial.unsplit(buf);
-		assert_eq!(decoder.decode(&mut partial).unwrap().unwrap(), &b"payload"[..]);
+		assert_eq!(
+			decoder.decode(&mut partial).unwrap().unwrap(),
+			&b"payload"[..]
+		);
 	}
 
 	/// Frames are bound to their position in the stream, so a replayed or reordered frame

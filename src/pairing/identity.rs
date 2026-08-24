@@ -97,9 +97,7 @@ impl Identity {
 				info!("generated pairing identity {}", identity.pairing_id);
 				Ok(identity)
 			}
-			Err(err) => {
-				Err(err).with_context(|| format!("failed to read {}", path.display()))
-			}
+			Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
 		}
 	}
 

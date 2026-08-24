@@ -54,7 +54,9 @@ const MAX_FIELD_LEN: usize = 8 * 1024;
 
 /// DER for OID 1.2.840.113549.1.7.2, `signedData`, which every MFi certificate blob opens
 /// with once past the outer SEQUENCE header.
-const PKCS7_SIGNED_DATA_OID: &[u8] = &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
+const PKCS7_SIGNED_DATA_OID: &[u8] = &[
+	0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02,
+];
 
 /// Derive the AES-128-CTR key and initial counter block from the Curve25519 shared secret.
 ///
@@ -119,7 +121,10 @@ impl std::fmt::Debug for AccessoryAuth {
 		f.debug_struct("AccessoryAuth")
 			.field("accessory_public_key", &hex(&self.accessory_public_key))
 			.field("device_public_key", &hex(&self.device_public_key))
-			.field("certificate", &format_args!("{} bytes", self.certificate.len()))
+			.field(
+				"certificate",
+				&format_args!("{} bytes", self.certificate.len()),
+			)
 			.field("signature", &format_args!("{} bytes", self.signature.len()))
 			.field("shared_secret", &"<redacted>")
 			.finish()
@@ -271,7 +276,8 @@ impl<'a> Reader<'a> {
 		let length = self
 			.take(4)
 			.with_context(|| format!("response is too short for the {field} length"))?;
-		let length = u32::from_be_bytes(length.try_into().expect("take(4) yields 4 bytes")) as usize;
+		let length =
+			u32::from_be_bytes(length.try_into().expect("take(4) yields 4 bytes")) as usize;
 
 		if length > MAX_FIELD_LEN {
 			bail!("auth-setup {field} claims {length} bytes, which is implausible");
@@ -378,7 +384,11 @@ mod tests {
 		Aes128Ctr::new(&key.into(), &iv.into()).apply_keystream(&mut ciphertext);
 		assert_ne!(ciphertext, plaintext);
 
-		let body = response(accessory_public.as_bytes(), &certificate_stub(908), &ciphertext);
+		let body = response(
+			accessory_public.as_bytes(),
+			&certificate_stub(908),
+			&ciphertext,
+		);
 		let result = auth.process_response(&body).unwrap();
 
 		assert_eq!(result.signature, plaintext);
@@ -410,7 +420,10 @@ mod tests {
 		body.extend_from_slice(&u32::MAX.to_be_bytes());
 		body.extend_from_slice(&[0u8; 16]);
 
-		let err = AuthSetup::new().process_response(&body).unwrap_err().to_string();
+		let err = AuthSetup::new()
+			.process_response(&body)
+			.unwrap_err()
+			.to_string();
 		assert!(err.contains("implausible"), "{err}");
 	}
 
@@ -426,7 +439,10 @@ mod tests {
 	fn rejects_a_certificate_that_is_not_pkcs7() {
 		let body = response(&[0u8; 32], &vec![0x41u8; 908], &[0u8; SIGNATURE_LEN]);
 
-		let err = AuthSetup::new().process_response(&body).unwrap_err().to_string();
+		let err = AuthSetup::new()
+			.process_response(&body)
+			.unwrap_err()
+			.to_string();
 		assert!(err.contains("PKCS#7"), "{err}");
 	}
 

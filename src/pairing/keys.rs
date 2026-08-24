@@ -44,14 +44,26 @@ pub fn stream_nonce(counter: u64) -> [u8; 12] {
 /// Encrypt, returning the ciphertext with its 16-byte tag appended.
 pub fn seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
 	ChaCha20Poly1305::new(key.into())
-		.encrypt(nonce.into(), Payload { msg: plaintext, aad })
+		.encrypt(
+			nonce.into(),
+			Payload {
+				msg: plaintext,
+				aad,
+			},
+		)
 		.map_err(|_| anyhow::anyhow!("ChaCha20-Poly1305 encryption failed"))
 }
 
 /// Decrypt a ciphertext that carries its 16-byte tag at the end.
 pub fn open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
 	ChaCha20Poly1305::new(key.into())
-		.decrypt(nonce.into(), Payload { msg: ciphertext, aad })
+		.decrypt(
+			nonce.into(),
+			Payload {
+				msg: ciphertext,
+				aad,
+			},
+		)
 		.map_err(|_| anyhow::anyhow!("ChaCha20-Poly1305 authentication failed"))
 }
 
@@ -70,8 +82,16 @@ impl SessionKeys {
 	/// Keys for the RTSP control connection (§30.3.2.2.1).
 	pub fn control(shared_secret: &[u8; 32]) -> Self {
 		Self {
-			read: derive(shared_secret, b"Control-Salt", b"Control-Read-Encryption-Key"),
-			write: derive(shared_secret, b"Control-Salt", b"Control-Write-Encryption-Key"),
+			read: derive(
+				shared_secret,
+				b"Control-Salt",
+				b"Control-Read-Encryption-Key",
+			),
+			write: derive(
+				shared_secret,
+				b"Control-Salt",
+				b"Control-Write-Encryption-Key",
+			),
 		}
 	}
 

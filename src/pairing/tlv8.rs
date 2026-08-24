@@ -155,7 +155,10 @@ impl Tlv8 {
 	/// Fail if the accessory reported an error, naming it.
 	pub fn check_error(&self, context: &str) -> Result<()> {
 		if let Some(code) = self.get_u8(ty::ERROR) {
-			bail!("{context}: accessory returned {} ({code:#04x})", error_name(code));
+			bail!(
+				"{context}: accessory returned {} ({code:#04x})",
+				error_name(code)
+			);
 		}
 
 		Ok(())
@@ -186,7 +189,8 @@ mod tests {
 	#[test]
 	fn round_trips_small_items() {
 		let mut tlv = Tlv8::new();
-		tlv.push_u8(ty::STATE, 3).push(ty::IDENTIFIER, b"hello".to_vec());
+		tlv.push_u8(ty::STATE, 3)
+			.push(ty::IDENTIFIER, b"hello".to_vec());
 
 		// HAP R13 §16.1.2, TLV Example 1.
 		assert_eq!(tlv.encode(), b"\x06\x01\x03\x01\x05hello");

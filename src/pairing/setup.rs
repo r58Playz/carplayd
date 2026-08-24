@@ -29,7 +29,7 @@ use crate::pairing::{
 /// PIN shows up as `kTLVError_Authentication` in M4.
 pub const CARPLAY_PIN: &str = "3939";
 
-pub type AccessoryLTPK = [u8; 32]; 
+pub type AccessoryLTPK = [u8; 32];
 /// What we keep once pair-setup succeeds.
 pub struct Pairing {
 	/// `AccessoryPairingID`, which should equal the accessory's `pi` TXT value.
@@ -111,7 +111,10 @@ impl<'a> PairSetup<'a> {
 
 		let mut sub_tlv = Tlv8::new();
 		sub_tlv
-			.push(ty::IDENTIFIER, self.identity.pairing_id().as_bytes().to_vec())
+			.push(
+				ty::IDENTIFIER,
+				self.identity.pairing_id().as_bytes().to_vec(),
+			)
 			.push(ty::PUBLIC_KEY, public_key.to_vec())
 			.push(ty::SIGNATURE, self.identity.sign(&info).to_vec());
 
@@ -125,7 +128,8 @@ impl<'a> PairSetup<'a> {
 		.context("failed to encrypt the pair-setup M5 sub-TLV")?;
 
 		let mut tlv = Tlv8::new();
-		tlv.push_u8(ty::STATE, 5).push(ty::ENCRYPTED_DATA, encrypted);
+		tlv.push_u8(ty::STATE, 5)
+			.push(ty::ENCRYPTED_DATA, encrypted);
 
 		Ok(tlv.encode())
 	}
