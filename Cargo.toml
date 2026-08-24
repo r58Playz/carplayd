@@ -11,12 +11,25 @@ nusb = { version = "0.2.3", features = ["tokio"] }
 tokio = { version = "1.51.0", features = ["full"] }
 libc = "0.2"
 usb-gadget = { version = "1.1.1", features = ["tokio"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
 futures = "0.3"
 bytes = "1"
 thiserror = "2"
 mdns-sd = { version = "0.21.0", features = ["async"] }
 rtnetlink = "0.23.0"
-hyper = { version = "1.11.0", features = ["server", "http1"] }
+hyper = { version = "1.11.0", features = ["server", "http1", "client"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 http-body-util = "0.1.5"
+
+# CarPlay pairing (HAP pair-setup / pair-verify) and control channel encryption
+chacha20poly1305 = "0.10"
+aes = "0.8"
+ctr = "0.9"
+hkdf = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+num-bigint = { version = "0.4", features = ["rand"] }
+rand = "0.8"
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["derive"] }

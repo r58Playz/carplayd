@@ -1,4 +1,7 @@
-use std::{net::{IpAddr, Ipv6Addr}, pin::pin};
+use std::{
+	net::{IpAddr, Ipv6Addr},
+	pin::pin,
+};
 
 use anyhow::{Context, Result, bail};
 use futures::{FutureExt, StreamExt, future::select};
@@ -13,9 +16,9 @@ use rtnetlink::{
 };
 use tokio::fs::read_dir;
 
-use crate::host::head_unit::HeadUnit;
+use crate::carplay::usb::head_unit::HeadUnitUsb;
 
-pub async fn get_ncm_device_name(head_unit: &HeadUnit) -> Result<String> {
+pub async fn get_ncm_device_name(head_unit: &HeadUnitUsb) -> Result<String> {
 	let active_config = head_unit
 		.device
 		.active_configuration()

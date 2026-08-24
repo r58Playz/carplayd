@@ -9,7 +9,7 @@ use log::{debug, trace, warn};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::{net::TcpListener, sync::mpsc::UnboundedSender, task::JoinSet};
 
-use crate::host::MacAddr;
+use crate::carplay::MacAddr;
 
 pub struct CarplayCtrlServer {
 	pub conn_tx: UnboundedSender<MacAddr>,

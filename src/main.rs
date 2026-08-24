@@ -1,7 +1,4 @@
-use std::{
-	sync::Arc,
-	time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use log::{LevelFilter, debug, info, warn};
@@ -13,27 +10,28 @@ use tokio::{
 };
 
 use crate::{
-	dwc2::{Dwc2, Mode},
-	gadget::{run_gadget, udc_name},
-	host::{
-		head_unit::{HeadUnit, find_iap2_device},
-		mdns_client::find_head_unit_server,
-		mdns_server::CarplayCtrlServer,
-		ncm::{configure_ncm, get_ncm_device_name},
+	carplay::{
+		ctrl_server::CarplayCtrlServer,
+		head_unit_discover::find_head_unit_server,
+		usb::{
+			dwc2::{Dwc2, Mode},
+			head_unit::{HeadUnitUsb, find_iap2_device},
+			ncm::{configure_ncm, get_ncm_device_name},
+		},
 	},
+	gadget::{run_gadget, udc_name},
 	iap2::{
 		ControlSession, DefaultPolicy, DeviceProfile, Handshake, Link, LinkParams, MAX_PACKET_LEN,
 		Role, policy, transport::bulk,
 	},
 };
 
-mod dwc2;
+mod carplay;
 mod gadget;
-mod host;
 mod iap2;
+mod pairing;
 
-/// §60.6 step 7: the accessory waits at least 1000 ms for us to start enumerating.
-const HEAD_UNIT_ATTEMPTS: u32 = 200;
+const HEAD_UNIT_ATTEMPTS: u32 = 100;
 const HEAD_UNIT_INTERVAL: Duration = Duration::from_millis(10);
 
 async fn force_mode(dwc2: &Arc<Dwc2>, mode: Mode) -> Result<()> {
@@ -41,7 +39,7 @@ async fn force_mode(dwc2: &Arc<Dwc2>, mode: Mode) -> Result<()> {
 	spawn_blocking(move || dwc2.force_mode(mode)).await?
 }
 
-async fn run_usb_handshake(sn: &str) -> Result<HeadUnit> {
+async fn run_usb_handshake(sn: &str) -> Result<HeadUnitUsb> {
 	let controller_name = spawn_blocking(udc_name)
 		.await?
 		.context("failed to get controller name")?;
@@ -59,8 +57,6 @@ async fn run_usb_handshake(sn: &str) -> Result<HeadUnit> {
 		bail!("iAP2 accessory rejected us");
 	}
 
-	let switched = Instant::now();
-
 	info!("starting host mode");
 	gadget
 		.unbind()
@@ -68,25 +64,19 @@ async fn run_usb_handshake(sn: &str) -> Result<HeadUnit> {
 	force_mode(&dwc2, Mode::Host)
 		.await
 		.context("failed to force controller into host mode")?;
-	debug!(
-		"host mode reached {:?} after the role switch",
-		switched.elapsed()
-	);
+	debug!("host mode reached");
 
 	let head_unit = find_iap2_device(HEAD_UNIT_ATTEMPTS, HEAD_UNIT_INTERVAL)
 		.await
 		.context("failed to find the carplay head unit")?;
-	info!(
-		"found head unit {:?} after the role switch",
-		switched.elapsed()
-	);
+	info!("found head unit");
 
 	gadget.remove().context("failed to remove gadget")?;
 
 	Ok(head_unit)
 }
 
-async fn run_usb_iap2(head_unit: HeadUnit) -> Result<()> {
+async fn run_usb_iap2(head_unit: HeadUnitUsb) -> Result<()> {
 	let transport = bulk::open(&head_unit.device, head_unit.iap2_interface, MAX_PACKET_LEN)
 		.await
 		.context("failed to open the iAP2 bulk transport")?;
@@ -95,11 +85,6 @@ async fn run_usb_iap2(head_unit: HeadUnit) -> Result<()> {
 	let mut session = ControlSession::new(link);
 	let mut handshake = Handshake::with_policy(DeviceProfile::default(), DefaultPolicy);
 
-	info!(
-		"iAP2 over bulk with {:04x}:{:04x}; waiting for the accessory's detection sequence",
-		head_unit.device_info.vendor_id(),
-		head_unit.device_info.product_id()
-	);
 	let result = policy::drive(&mut session, &mut handshake, |h, params| {
 		info!("iAP2 control session ready over {params:?}");
 		let control = head_unit.ncm_control_interface;

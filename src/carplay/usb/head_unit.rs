@@ -1,10 +1,3 @@
-//! Finding the head unit after the USB role switch, when we are the host.
-//!
-//! Per §30.2.4.2 the accessory then presents a single configuration holding a
-//! vendor-specific iAP2 interface plus a USB NCM control/data pair. We claim the iAP2
-//! interface ourselves; the NCM pair belongs to the kernel's `cdc_ncm` driver, which is
-//! what brings up the `usb0` netdev the CarPlay session runs over.
-
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -13,9 +6,8 @@ use nusb::{Device, DeviceInfo, list_devices};
 
 use crate::iap2::transport::bulk::{IAP2_INTERFACE, NCM_CONTROL_INTERFACE, NCM_DATA_INTERFACE};
 
-/// The head unit, once enumerated.
 #[derive(Clone)]
-pub struct HeadUnit {
+pub struct HeadUnitUsb {
 	pub device: Device,
 	pub device_info: DeviceInfo,
 	pub iap2_interface: u8,
@@ -23,14 +15,13 @@ pub struct HeadUnit {
 	pub ncm_data_interface: u8,
 }
 
-/// The interface number matching a class/subclass/protocol triple.
 fn interface_matching(d: &DeviceInfo, (class, subclass, protocol): (u8, u8, u8)) -> Option<u8> {
 	d.interfaces()
 		.find(|i| i.class() == class && i.subclass() == subclass && i.protocol() == protocol)
 		.map(|i| i.interface_number())
 }
 
-pub async fn find_iap2_device(attempts: u32, interval: Duration) -> Result<HeadUnit> {
+pub async fn find_iap2_device(attempts: u32, interval: Duration) -> Result<HeadUnitUsb> {
 	for attempt in 0..attempts {
 		let devices: Vec<DeviceInfo> = list_devices()
 			.await
@@ -53,7 +44,7 @@ pub async fn find_iap2_device(attempts: u32, interval: Duration) -> Result<HeadU
 				info.product_id(),
 			);
 
-			return Ok(HeadUnit {
+			return Ok(HeadUnitUsb {
 				device: info.open().await.context("failed to open iAP2 device")?,
 				device_info: info,
 				iap2_interface,

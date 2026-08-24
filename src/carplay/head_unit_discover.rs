@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::debug;
 use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent};
 
-use crate::host::MacAddr;
+use crate::carplay::MacAddr;
 
 pub struct HeadUnitServer {
 	mac: MacAddr,
@@ -13,13 +13,19 @@ pub struct HeadUnitServer {
 	model: String,
 }
 
-fn parse_head_unit_service(info: &ResolvedService, target_mac: Option<MacAddr>, scope_id: u32) -> Result<HeadUnitServer> {
-	let flags: usize = info
-		.txt_properties
-		.get_property_val_str("flags")
-		.context("no flags property in carplay")?
-		.parse()
-		.context("invalid flags property")?;
+fn parse_head_unit_service(
+	info: &ResolvedService,
+	target_mac: Option<MacAddr>,
+	scope_id: u32,
+) -> Result<HeadUnitServer> {
+	let flags = usize::from_str_radix(
+		info.txt_properties
+			.get_property_val_str("flags")
+			.context("no flags property in carplay")?
+			.trim_start_matches("0x"),
+		16,
+	)
+	.context("invalid flags property")?;
 
 	if flags & 0b010 != 0 {
 		bail!("head unit not configured according to flags");
@@ -78,7 +84,11 @@ fn parse_head_unit_service(info: &ResolvedService, target_mac: Option<MacAddr>, 
 	})
 }
 
-pub async fn find_head_unit_server(mdns: ServiceDaemon, target_mac: Option<MacAddr>, scope_id: u32) -> Result<HeadUnitServer> {
+pub async fn find_head_unit_server(
+	mdns: ServiceDaemon,
+	target_mac: Option<MacAddr>,
+	scope_id: u32,
+) -> Result<HeadUnitServer> {
 	let browse = mdns
 		.browse("_airplay._tcp.local.")
 		.context("failed to browse for head unit")?;
