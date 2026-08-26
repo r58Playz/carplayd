@@ -142,7 +142,7 @@ impl<'a> PairVerify<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::host::pairing::keys::SessionKeys;
+	use crate::pairing::keys::SessionKeys;
 
 	#[test]
 	fn m1_offers_a_32_byte_public_key() {

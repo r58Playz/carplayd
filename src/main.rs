@@ -1,9 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use log::{LevelFilter, debug, info, warn};
 use mdns_sd::{IfKind, ServiceDaemon};
 use tokio::{
+	fs,
 	sync::mpsc,
 	task::{JoinSet, spawn_blocking},
 	time::timeout,
@@ -11,16 +12,17 @@ use tokio::{
 
 use crate::{
 	carplay::{
+		CarplaySession,
 		ctrl_server::CarplayCtrlServer,
 		net::head_unit::find_head_unit_server,
 		usb::{
 			dwc2::{Dwc2, Mode},
 			head_unit::{HeadUnitUsb, find_iap2_device},
 			ncm::{configure_ncm, get_ncm_device_name},
-			run_usb_iap2,
 		},
 	},
 	gadget::{run_gadget, udc_name},
+	pairing::identity::{Identity, PairingStore},
 };
 
 mod carplay;
@@ -82,19 +84,28 @@ async fn main() -> Result<()> {
 		.parse_default_env()
 		.init();
 
-	let sn = std::env::args().nth(1).context("no serial provided")?;
+	let dir = PathBuf::from(std::env::args().nth(1).context("no config dir provided")?);
 
 	let mut set = JoinSet::new();
+	let sn = fs::read_to_string(dir.join("serial_number"))
+		.await
+		.context("failed to read sn from config dir")?;
+	let mut identity = Identity::load_or_generate(&dir.join("identity"))
+		.await
+		.context("failed to load identity")?;
+	let mut pairing = PairingStore::load(&dir.join("pairing"))
+		.await
+		.context("failed to load pairing store")?;
 
 	let mdns = ServiceDaemon::new().context("failed to create mdns server")?;
 	mdns.disable_interface(IfKind::All)
 		.context("failed to blacklist all interfaces")?;
 
-	let head_unit = run_usb_handshake(&sn)
+	let head_unit_usb = run_usb_handshake(&sn)
 		.await
 		.context("failed to run usb handshake")?;
 
-	let net_iface = get_ncm_device_name(&head_unit)
+	let net_iface = get_ncm_device_name(&head_unit_usb)
 		.await
 		.context("failed to get ncm device name")?;
 	let (ip, scope_id) = configure_ncm(&net_iface)
@@ -115,7 +126,6 @@ async fn main() -> Result<()> {
 		}
 		.run(),
 	);
-	set.spawn(run_usb_iap2(head_unit.clone()));
 
 	let target_mac = timeout(Duration::from_millis(500), conn_rx.recv())
 		.await
@@ -131,11 +141,25 @@ async fn main() -> Result<()> {
 		warn!("carplay-ctrl timed out");
 	}
 
-	let head_unit_server = find_head_unit_server(mdns, target_mac, scope_id)
+	let head_unit_net = find_head_unit_server(mdns, target_mac, scope_id)
 		.await
 		.context("failed to find head unit server")?;
 
-	set.join_all().await;
+	let (carplay_session, usb_session, net_session) =
+		CarplaySession::new(&head_unit_usb, head_unit_net, &mut identity, &mut pairing)
+			.await
+			.context("failed to handshake carplay session")?;
+
+	info!("carplay session ready");
+
+	set.spawn(usb_session.run());
+	set.spawn(net_session.run());
+	set.spawn(carplay_session.run());
+
+	while let Some(ret) = set.join_next().await {
+		ret.context("failed to join")?
+			.context("failed to drive carplay task")?
+	}
 
 	Ok(())
 }

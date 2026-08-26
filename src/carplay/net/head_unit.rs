@@ -7,10 +7,10 @@ use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent};
 use crate::carplay::MacAddr;
 
 pub struct HeadUnitServer {
-	mac: MacAddr,
-	addr: SocketAddrV6,
-	pairing_identity: String,
-	model: String,
+	pub mac: MacAddr,
+	pub addr: SocketAddrV6,
+	pub pairing_identity: String,
+	pub model: String,
 }
 
 fn parse_head_unit_service(

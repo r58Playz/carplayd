@@ -31,10 +31,9 @@
 //! let link = Link::new(transport, Role::Device, LinkParams::usb_recommended());
 //! let mut session = ControlSession::new(link);
 //! let mut handshake = Handshake::new(DeviceProfile::default());
-//! policy::drive(&mut session, &mut handshake, |h, params| {
-//!     info!("iAP2 ready over {params:?}; CarPlay interface {:?}", h.carplay_interface());
-//! })
-//! .await
+//! let params = policy::drive_until_ready(&mut session, &mut handshake).await?;
+//! info!("iAP2 ready over {params:?}; CarPlay interface {:?}", handshake.carplay_interface());
+//! policy::drive(&mut session, &mut handshake).await
 //! ```
 
 // `carplayd` is a binary, so nothing outside it consumes this module's API and the

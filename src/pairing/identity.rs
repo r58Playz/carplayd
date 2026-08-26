@@ -8,7 +8,6 @@
 
 use std::{
 	collections::HashMap,
-	fs,
 	path::{Path, PathBuf},
 };
 
@@ -16,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use log::{debug, info};
 use rand::{RngCore, rngs::OsRng};
+use tokio::fs;
 
 /// Format 16 random bytes the way iOS formats its pairing identifier.
 fn random_uuid() -> String {
@@ -83,8 +83,8 @@ impl Identity {
 	}
 
 	/// Load from disk, generating and saving a fresh identity when the file is absent.
-	pub fn load_or_generate(path: &Path) -> Result<Self> {
-		match fs::read_to_string(path) {
+	pub async fn load_or_generate(path: &Path) -> Result<Self> {
+		match fs::read_to_string(path).await {
 			Ok(contents) => {
 				let identity = Self::parse(&contents)
 					.with_context(|| format!("failed to parse identity at {}", path.display()))?;
@@ -93,7 +93,7 @@ impl Identity {
 			}
 			Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
 				let identity = Self::generate();
-				identity.save(path)?;
+				identity.save(path).await?;
 				info!("generated pairing identity {}", identity.pairing_id);
 				Ok(identity)
 			}
@@ -116,19 +116,16 @@ impl Identity {
 		})
 	}
 
-	fn save(&self, path: &Path) -> Result<()> {
-		if let Some(parent) = path.parent() {
-			fs::create_dir_all(parent)
-				.with_context(|| format!("failed to create {}", parent.display()))?;
-		}
-
+	async fn save(&self, path: &Path) -> Result<()> {
 		let contents = format!(
 			"{}\n{}\n",
 			self.pairing_id,
 			to_hex(self.signing_key.as_bytes())
 		);
 
-		fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+		fs::write(path, contents)
+			.await
+			.with_context(|| format!("failed to write {}", path.display()))
 	}
 }
 
@@ -144,10 +141,10 @@ pub struct PairingStore {
 
 impl PairingStore {
 	/// Load the store, treating a missing file as empty.
-	pub fn load(path: &Path) -> Result<Self> {
+	pub async fn load(path: &Path) -> Result<Self> {
 		let mut accessories = HashMap::new();
 
-		match fs::read_to_string(path) {
+		match fs::read_to_string(path).await {
 			Ok(contents) => {
 				for (number, line) in contents.lines().enumerate() {
 					let line = line.trim();
@@ -186,23 +183,19 @@ impl PairingStore {
 	}
 
 	/// Record a pairing from pair-setup M6 and flush the store.
-	pub fn insert(&mut self, accessory_id: &str, ltpk: [u8; 32]) -> Result<()> {
+	pub async fn insert(&mut self, accessory_id: &str, ltpk: [u8; 32]) -> Result<()> {
 		self.accessories.insert(accessory_id.to_string(), ltpk);
-		self.save()
+		self.save().await
 	}
 
-	fn save(&self) -> Result<()> {
-		if let Some(parent) = self.path.parent() {
-			fs::create_dir_all(parent)
-				.with_context(|| format!("failed to create {}", parent.display()))?;
-		}
-
+	async fn save(&self) -> Result<()> {
 		let mut contents = String::new();
 		for (id, key) in &self.accessories {
 			contents.push_str(&format!("{id} {}\n", to_hex(key)));
 		}
 
 		fs::write(&self.path, contents)
+			.await
 			.with_context(|| format!("failed to write {}", self.path.display()))
 	}
 }

@@ -600,94 +600,131 @@ pub fn log_identification(msg: &Message) {
 	}
 }
 
-/// Run the handshake to completion, then keep answering the accessory.
+/// One iteration of the control loop: wait for something to happen, then answer it.
 ///
-/// Returns when the transport ends or the link resets. `on_ready` fires each time the
-/// handshake completes, with the handshake and the negotiated parameters.
-pub async fn drive<T, P, F>(
+/// `Ok(false)` means the transport ended. Whether the handshake has finished is left for
+/// the caller to check, which is what lets [`drive_until_ready`] stop where [`drive`]
+/// carries on.
+async fn step<T, P>(
 	session: &mut ControlSession<T>,
 	handshake: &mut Handshake<P>,
-	mut on_ready: F,
+) -> Result<bool, Error>
+where
+	T: futures::Stream<Item = Result<Frame, Error>> + futures::Sink<Frame, Error = Error> + Unpin,
+	P: Policy,
+{
+	// Three things can wake us: the accessory, the policy wanting to report something
+	// unprompted, or the authentication budget running out while the accessory says
+	// nothing at all. The borrow of `handshake` has to end before the branch bodies
+	// touch it, so the select only classifies the wake-up.
+	let wake = {
+		let deadline = handshake.auth_deadline();
+		let policy = handshake.policy_mut();
+		tokio::select! {
+			event = session.next() => Wake::Event(event),
+			outbound = policy.next_outbound() => Wake::Outbound(outbound),
+			() = deadline_elapsed(deadline) => Wake::AuthDeadline,
+		}
+	};
+
+	let replies = match wake {
+		Wake::AuthDeadline => {
+			handshake.check_deadline(Instant::now())?;
+			return Ok(true);
+		}
+		Wake::Outbound(msgs) => msgs,
+		Wake::Event(None) => return Ok(false),
+		Wake::Event(Some(event)) => match event? {
+			ControlEvent::Established(params) => {
+				if handshake.ready() {
+					warn!("reestablished connection??");
+				}
+				handshake.on_established(params, Instant::now())
+			}
+			ControlEvent::Message(msg) => {
+				debug!("rx {msg:?}");
+				if msg.id == ids::ID_IDENTIFICATION_INFORMATION
+					|| msg.id == ids::ID_IDENTIFICATION_INFORMATION_UPDATE
+				{
+					log_identification(&msg);
+				}
+				if msg.id == ids::ID_AUTHENTICATION_FAILED {
+					// The accessory decides this, not us; there is no recovery.
+					return Err(Error::Timeout("accessory authentication"));
+				}
+				handshake.on_message(&msg)
+			}
+			ControlEvent::OtherSession { session: id, len } => {
+				debug!("ignoring {len} bytes on session {id}");
+				Vec::new()
+			}
+			ControlEvent::Reset => {
+				handshake.on_reset();
+				return Err(Error::Reset);
+			}
+			ControlEvent::Sleep => {
+				info!("accessory reported sleep");
+				Vec::new()
+			}
+		},
+	};
+
+	for reply in replies {
+		session.send(reply).await?;
+	}
+
+	Ok(true)
+}
+
+/// Run the handshake to completion, returning the negotiated link parameters.
+///
+/// The accessory drives this exchange -- it sends identification and authentication, we
+/// answer -- so the control loop has to be running for the handshake to finish. That is
+/// why this is a separate entry point rather than a future you can await before starting
+/// the loop: there is no such moment. A caller that wants a session it can prove is
+/// authenticated calls this, then [`drive`] for the rest of the session.
+pub async fn drive_until_ready<T, P>(
+	session: &mut ControlSession<T>,
+	handshake: &mut Handshake<P>,
+) -> Result<LinkParams, Error>
+where
+	T: futures::Stream<Item = Result<Frame, Error>> + futures::Sink<Frame, Error = Error> + Unpin,
+	P: Policy,
+{
+	loop {
+		if !step(session, handshake).await? {
+			return Err(Error::Closed);
+		}
+
+		if handshake.ready()
+			&& let Some(params) = handshake.params.clone()
+		{
+			return Ok(params);
+		}
+	}
+}
+
+/// Keep answering the accessory until the transport ends or the link resets.
+///
+/// Always returns an error: an iAP2 session has no successful end, only a reason it
+/// stopped. Call [`drive_until_ready`] first if the handshake must have completed before
+/// whatever comes next.
+pub async fn drive<T, P>(
+	session: &mut ControlSession<T>,
+	handshake: &mut Handshake<P>,
 ) -> Result<(), Error>
 where
 	T: futures::Stream<Item = Result<Frame, Error>> + futures::Sink<Frame, Error = Error> + Unpin,
 	P: Policy,
-	F: FnMut(&Handshake<P>, &LinkParams),
 {
-	let mut announced = false;
-
 	loop {
-		// Three things can wake us: the accessory, the policy wanting to report something
-		// unprompted, or the authentication budget running out while the accessory says
-		// nothing at all. The borrow of `handshake` has to end before the branch bodies
-		// touch it, so the select only classifies the wake-up.
-		let wake = {
-			let deadline = handshake.auth_deadline();
-			let policy = handshake.policy_mut();
-			tokio::select! {
-				event = session.next() => Wake::Event(event),
-				outbound = policy.next_outbound() => Wake::Outbound(outbound),
-				() = deadline_elapsed(deadline) => Wake::AuthDeadline,
-			}
-		};
-
-		let replies = match wake {
-			Wake::AuthDeadline => {
-				handshake.check_deadline(Instant::now())?;
-				continue;
-			}
-			Wake::Outbound(msgs) => msgs,
-			Wake::Event(None) => break,
-			Wake::Event(Some(event)) => match event? {
-				ControlEvent::Established(params) => {
-					announced = false;
-					handshake.on_established(params, Instant::now())
-				}
-				ControlEvent::Message(msg) => {
-					debug!("rx {msg:?}");
-					if msg.id == ids::ID_IDENTIFICATION_INFORMATION
-						|| msg.id == ids::ID_IDENTIFICATION_INFORMATION_UPDATE
-					{
-						log_identification(&msg);
-					}
-					if msg.id == ids::ID_AUTHENTICATION_FAILED {
-						// The accessory decides this, not us; there is no recovery.
-						return Err(Error::Timeout("accessory authentication"));
-					}
-					handshake.on_message(&msg)
-				}
-				ControlEvent::OtherSession { session: id, len } => {
-					debug!("ignoring {len} bytes on session {id}");
-					Vec::new()
-				}
-				ControlEvent::Reset => {
-					handshake.on_reset();
-					return Err(Error::Reset);
-				}
-				ControlEvent::Sleep => {
-					info!("accessory reported sleep");
-					Vec::new()
-				}
-			},
-		};
-
-		for reply in replies {
-			session.send(reply).await?;
-		}
-
-		if handshake.ready()
-			&& !announced
-			&& let Some(params) = handshake.params.clone()
-		{
-			announced = true;
-			on_ready(handshake, &params);
+		if !step(session, handshake).await? {
+			return Err(Error::Closed);
 		}
 	}
-
-	Err(Error::Closed)
 }
 
-/// What woke [`drive`].
+/// What woke [`step`].
 enum Wake {
 	Event(Option<Result<ControlEvent, Error>>),
 	Outbound(Vec<Message>),
@@ -945,17 +982,17 @@ mod tests {
 
 		let mut handshake = Handshake::new(DeviceProfile::default());
 		let phone = async {
-			let mut ready_params = None;
-			let result = drive(&mut device, &mut handshake, |_, params| {
-				ready_params = Some(params.clone());
-			})
-			.await;
+			let ready_params = drive_until_ready(&mut device, &mut handshake)
+				.await
+				.expect("the handshake should complete");
+
+			let result = drive(&mut device, &mut handshake).await;
 			// `drive` only returns on failure; the accessory hanging up is the expected one.
 			assert!(
 				matches!(result, Err(Error::Closed) | Err(Error::Transport(_))),
 				"{result:?}"
 			);
-			ready_params
+			Some(ready_params)
 		};
 
 		let (seen, ready) = tokio::time::timeout(
@@ -1183,7 +1220,7 @@ mod tests {
 			},
 		);
 		let phone = async {
-			let result = drive(&mut device, &mut handshake, |_, _| {}).await;
+			let result = drive(&mut device, &mut handshake).await;
 			assert!(
 				matches!(result, Err(Error::Closed) | Err(Error::Transport(_))),
 				"{result:?}"

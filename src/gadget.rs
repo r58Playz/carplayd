@@ -238,14 +238,17 @@ pub async fn run_gadget(sn: &str) -> Result<(GadgetGuard, Result<bool>)> {
 			..DeviceProfile::default()
 		});
 
-		match policy::drive(&mut session, &mut handshake, |h, params| {
+		let result = async {
+			let params = policy::drive_until_ready(&mut session, &mut handshake).await?;
 			info!("iAP2 ready over HID: {params:?}");
-			if let Some(iface) = h.carplay_interface() {
+			if let Some(iface) = handshake.carplay_interface() {
 				info!("accessory nominated CarPlay interface {iface}");
 			}
-		})
-		.await
-		{
+			policy::drive(&mut session, &mut handshake).await
+		}
+		.await;
+
+		match result {
 			Err(Error::Closed) => debug!("iAP2 over HID ended with the transport"),
 			Err(err) => warn!("iAP2 over HID failed: {err}"),
 			Ok(()) => {}

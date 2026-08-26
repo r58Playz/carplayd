@@ -97,12 +97,23 @@ impl SessionKeys {
 
 	/// Keys for the event connection (§30.3.2.2.1).
 	///
-	/// The accessory originates requests on this one, so although the derivation mirrors
-	/// the control channel, `read` here carries inbound requests rather than responses.
+	/// Note the swap against [`Self::control`]. The spec's note reads: on the control
+	/// connection the accessory "uses the write key for reading requests and the read key
+	/// for writing responses"; on the event connection it "uses the read key for reading
+	/// responses and the write key for writing requests".
+	///
+	/// Line those two clauses up and the rule is that the key follows the *message type*,
+	/// not the socket direction — requests are always sealed under
+	/// `*-Write-Encryption-Key` and responses under `*-Read-Encryption-Key`, named for the
+	/// device, which normally writes requests and reads responses. The event channel
+	/// reverses who sends requests, so it reverses which key each end uses.
+	///
+	/// We are the HTTP server here, so we decrypt the accessory's requests with the
+	/// write-named key and encrypt our responses with the read-named key.
 	pub fn event(shared_secret: &[u8; 32]) -> Self {
 		Self {
-			read: derive(shared_secret, b"Event-Salt", b"Event-Read-Encryption-Key"),
-			write: derive(shared_secret, b"Event-Salt", b"Event-Write-Encryption-Key"),
+			read: derive(shared_secret, b"Event-Salt", b"Event-Write-Encryption-Key"),
+			write: derive(shared_secret, b"Event-Salt", b"Event-Read-Encryption-Key"),
 		}
 	}
 
@@ -192,6 +203,33 @@ mod tests {
 		assert_ne!(control.read, control.write);
 		assert_ne!(control.read, event.read);
 		assert_ne!(control.write, event.write);
+	}
+
+	/// The event channel reverses who sends requests, so the key each end uses reverses
+	/// with it. Getting this wrong yields a channel that fails to authenticate its very
+	/// first frame, long after pair-verify has appeared to succeed.
+	#[test]
+	fn event_keys_are_swapped_against_the_control_channel() {
+		let secret = [7u8; 32];
+		let event = SessionKeys::event(&secret);
+
+		assert_eq!(
+			event.read,
+			derive(&secret, b"Event-Salt", b"Event-Write-Encryption-Key"),
+			"we decrypt the accessory's requests with the write-named key"
+		);
+		assert_eq!(
+			event.write,
+			derive(&secret, b"Event-Salt", b"Event-Read-Encryption-Key"),
+			"we encrypt our responses with the read-named key"
+		);
+
+		let control = SessionKeys::control(&secret);
+		assert_eq!(
+			control.read,
+			derive(&secret, b"Control-Salt", b"Control-Read-Encryption-Key"),
+			"the control channel is not swapped"
+		);
 	}
 
 	#[test]
