@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use log::debug;
 
 use crate::pairing::{
-	identity::{Identity, verify_signature},
+	identity::{PairIdentity, verify_signature},
 	keys::{
 		open_sub_tlv, pair_setup_accessory_x, pair_setup_controller_x, pair_setup_session_key,
 		pairing_nonce, seal,
@@ -40,13 +40,13 @@ pub struct Pairing {
 
 /// Pair-setup driven one message at a time; the caller does the POSTing.
 pub struct PairSetup<'a> {
-	identity: &'a Identity,
+	identity: &'a PairIdentity,
 	client: SrpClient,
 	session: Option<Session>,
 }
 
 impl<'a> PairSetup<'a> {
-	pub fn new(identity: &'a Identity, pin: &str) -> Self {
+	pub fn new(identity: &'a PairIdentity, pin: &str) -> Self {
 		Self {
 			identity,
 			client: SrpClient::new(pin.as_bytes()),
@@ -185,7 +185,7 @@ mod tests {
 
 	#[test]
 	fn m1_requests_unauthenticated_pair_setup() {
-		let identity = Identity::generate();
+		let identity = PairIdentity::generate();
 		let setup = PairSetup::new(&identity, CARPLAY_PIN);
 
 		let tlv = Tlv8::parse(&setup.m1()).unwrap();
@@ -200,7 +200,7 @@ mod tests {
 
 	#[test]
 	fn m3_rejects_an_error_response() {
-		let identity = Identity::generate();
+		let identity = PairIdentity::generate();
 		let mut setup = PairSetup::new(&identity, CARPLAY_PIN);
 
 		let mut m2 = Tlv8::new();
@@ -212,7 +212,7 @@ mod tests {
 
 	#[test]
 	fn m3_rejects_the_wrong_state() {
-		let identity = Identity::generate();
+		let identity = PairIdentity::generate();
 		let mut setup = PairSetup::new(&identity, CARPLAY_PIN);
 
 		let mut m2 = Tlv8::new();
@@ -225,7 +225,7 @@ mod tests {
 
 	#[test]
 	fn m5_needs_m3_first() {
-		let identity = Identity::generate();
+		let identity = PairIdentity::generate();
 		let mut setup = PairSetup::new(&identity, CARPLAY_PIN);
 
 		let mut m4 = Tlv8::new();

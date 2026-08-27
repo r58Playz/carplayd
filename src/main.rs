@@ -14,6 +14,7 @@ use crate::{
 	carplay::{
 		CarplaySession,
 		ctrl_server::CarplayCtrlServer,
+		derive_device_id, format_mac_lower,
 		net::head_unit::find_head_unit_server,
 		usb::{
 			dwc2::{Dwc2, Mode},
@@ -22,13 +23,14 @@ use crate::{
 		},
 	},
 	gadget::{run_gadget, udc_name},
-	pairing::identity::{Identity, PairingStore},
+	pairing::identity::{PairIdentity, PairingStore},
 };
 
 mod carplay;
 mod gadget;
 mod iap2;
 mod pairing;
+mod provider;
 
 const HEAD_UNIT_ATTEMPTS: u32 = 100;
 const HEAD_UNIT_INTERVAL: Duration = Duration::from_millis(10);
@@ -90,7 +92,10 @@ async fn main() -> Result<()> {
 	let sn = fs::read_to_string(dir.join("serial_number"))
 		.await
 		.context("failed to read sn from config dir")?;
-	let mut identity = Identity::load_or_generate(&dir.join("identity"))
+	let sn = sn.trim();
+	let device_id = derive_device_id(sn);
+	info!("device id {}", format_mac_lower(device_id));
+	let mut identity = PairIdentity::load_or_generate(&dir.join("identity"))
 		.await
 		.context("failed to load identity")?;
 	let mut pairing = PairingStore::load(&dir.join("pairing"))
@@ -101,16 +106,22 @@ async fn main() -> Result<()> {
 	mdns.disable_interface(IfKind::All)
 		.context("failed to blacklist all interfaces")?;
 
-	let head_unit_usb = run_usb_handshake(&sn)
+	let head_unit_usb = run_usb_handshake(sn)
 		.await
 		.context("failed to run usb handshake")?;
 
 	let net_iface = get_ncm_device_name(&head_unit_usb)
 		.await
 		.context("failed to get ncm device name")?;
-	let (ip, scope_id) = configure_ncm(&net_iface)
+	let link = configure_ncm(&net_iface)
 		.await
 		.context("failed to configure ncm device")?;
+	debug!(
+		"ncm link up: {} scope {} mac {}",
+		link.ip,
+		link.scope_id,
+		format_mac_lower(link.mac)
+	);
 
 	mdns.enable_interface(&net_iface)
 		.context("failed to enable ncm device for mdns")?;
@@ -119,9 +130,10 @@ async fn main() -> Result<()> {
 	set.spawn(
 		CarplayCtrlServer {
 			conn_tx,
+			device_id,
 			mdns: mdns.clone(),
-			ip,
-			scope_id,
+			ip: link.ip,
+			scope_id: link.scope_id,
 			port: 6767,
 		}
 		.run(),
@@ -141,19 +153,26 @@ async fn main() -> Result<()> {
 		warn!("carplay-ctrl timed out");
 	}
 
-	let head_unit_net = find_head_unit_server(mdns, target_mac, scope_id)
+	let head_unit_net = find_head_unit_server(mdns, target_mac, link.scope_id)
 		.await
 		.context("failed to find head unit server")?;
 
-	let (carplay_session, usb_session, net_session) =
-		CarplaySession::new(&head_unit_usb, head_unit_net, &mut identity, &mut pairing)
-			.await
-			.context("failed to handshake carplay session")?;
+	let (carplay_session, usb, net) = CarplaySession::new(
+		&mut set,
+		&mut identity,
+		&mut pairing,
+		device_id,
+		link,
+		head_unit_usb,
+		head_unit_net,
+	)
+	.await
+	.context("failed to handshake carplay session")?;
 
 	info!("carplay session ready");
 
-	set.spawn(usb_session.run());
-	set.spawn(net_session.run());
+	set.spawn(usb.run());
+	set.spawn(net.run());
 	set.spawn(carplay_session.run());
 
 	while let Some(ret) = set.join_next().await {

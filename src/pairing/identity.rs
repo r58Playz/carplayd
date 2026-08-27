@@ -54,12 +54,12 @@ fn from_hex(text: &str) -> Result<Vec<u8>> {
 
 /// The identity we present as the iOS device: `iOSDevicePairingID` plus the Ed25519
 /// long-term key pair behind it.
-pub struct Identity {
+pub struct PairIdentity {
 	pairing_id: String,
 	signing_key: SigningKey,
 }
 
-impl Identity {
+impl PairIdentity {
 	pub fn generate() -> Self {
 		Self {
 			pairing_id: random_uuid(),
@@ -234,21 +234,21 @@ mod tests {
 
 	#[test]
 	fn identity_survives_a_round_trip() {
-		let identity = Identity::generate();
+		let identity = PairIdentity::generate();
 		let encoded = format!(
 			"{}\n{}\n",
 			identity.pairing_id,
 			to_hex(identity.signing_key.as_bytes())
 		);
 
-		let loaded = Identity::parse(&encoded).unwrap();
+		let loaded = PairIdentity::parse(&encoded).unwrap();
 		assert_eq!(loaded.pairing_id(), identity.pairing_id());
 		assert_eq!(loaded.public_key(), identity.public_key());
 	}
 
 	#[test]
 	fn signatures_verify_against_our_own_key() {
-		let identity = Identity::generate();
+		let identity = PairIdentity::generate();
 		let signature = identity.sign(b"iOSDeviceInfo");
 
 		assert!(verify_signature(&identity.public_key(), b"iOSDeviceInfo", &signature).is_ok());

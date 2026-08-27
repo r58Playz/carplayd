@@ -1,144 +1,141 @@
-use std::{net::SocketAddrV6, pin::pin};
+use std::net::SocketAddrV6;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::{
-	Request, Response,
-	body::{Body, Incoming},
-	client::conn::http1 as http1_client,
-	header,
-	server::conn::http1 as http1_server,
-	service::service_fn,
-};
-use hyper_util::rt::TokioIo;
-use tokio::{net::TcpStream, select};
-use tokio_util::either::Either;
+use serde::{Serialize, de::DeserializeOwned};
+use tokio::net::TcpStream;
+use tokio_util::{codec::FramedParts, either::Either};
 
 use crate::{
-	carplay::net::codec::{Transport, secure},
+	carplay::net::{
+		codec::{Transport, secure},
+		proto,
+		rtsp::{Channel, Message, Method, Request, Response},
+	},
 	pairing::{
 		auth_setup::{AccessoryAuth, AuthSetup},
-		identity::Identity,
+		identity::PairIdentity,
 		keys::SessionKeys,
 		setup::{AccessoryLTPK, CARPLAY_PIN, PairSetup, Pairing},
 		verify::PairVerify,
 	},
 };
 
+const USER_AGENT: &str = "AirPlay/440.10";
+
+const PAIRING_TLV8: &str = "application/pairing+tlv8";
+const OCTET_STREAM: &str = "application/octet-stream";
+
 pub struct HeadUnitTcpConnection {
-	socket: Option<Transport>,
+	channel: Option<Channel<Transport>>,
 }
+
 impl HeadUnitTcpConnection {
 	pub async fn new(addr: SocketAddrV6) -> Result<Self> {
 		let stream = TcpStream::connect(addr)
 			.await
 			.context("failed to connect")?;
 
+		stream.set_nodelay(true).context("failed to set nodelay")?;
+
 		Ok(Self {
-			socket: Some(Either::Left(stream)),
+			channel: Some(Channel::new(Either::Left(stream))),
 		})
 	}
 
 	pub fn upgrade(&mut self, keys: SessionKeys) -> Result<()> {
-		match self.socket.take() {
-			Some(Either::Left(socket)) => {
-				self.socket = Some(Either::Right(secure(socket, keys)));
-				Ok(())
-			}
-			Some(already @ Either::Right(_)) => {
-				self.socket = Some(already);
-				bail!("connection is already encrypted")
-			}
-			None => bail!("connection was left in a broken state"),
+		let channel = self
+			.channel
+			.take()
+			.context("connection was left in a broken state")?;
+		let (parts, cseq) = channel.into_parts();
+
+		if matches!(&parts.io, Either::Right(_)) {
+			self.channel = Some(Channel::from_parts(parts, cseq));
+			bail!("connection is already encrypted");
 		}
-	}
-
-	pub async fn serve_http<F, R>(&mut self, func: F) -> Result<()>
-	where
-		F: Fn(Request<Incoming>) -> R,
-		R: Future<Output = Result<Response<Full<Bytes>>>>,
-	{
-		let socket = self
-			.socket
-			.as_mut()
-			.context("connection was left in a broken state")?;
-
-		let service = service_fn(func);
-
-		let io = TokioIo::new(socket);
-		http1_server::Builder::new()
-			.serve_connection(io, service)
-			.await
-			.context("failed to service connection")
-	}
-
-	/// buffered
-	pub async fn http_req<B>(&mut self, req: Request<B>) -> Result<Response<Full<Bytes>>>
-	where
-		B: Body + 'static,
-		B::Data: Send,
-		B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-	{
-		let socket = self
-			.socket
-			.as_mut()
-			.context("connection was left in a broken state")?;
-		let io = TokioIo::new(socket);
-
-		let (mut sender, conn) = http1_client::Builder::new()
-			.handshake(io)
-			.await
-			.context("failed to handshake")?;
-
-		let fut = async move {
-			let (parts, body) = sender
-				.send_request(req)
-				.await
-				.context("failed to send req")?
-				.into_parts();
-
-			let body = body
-				.collect()
-				.await
-				.context("failed to collect body")?
-				.to_bytes();
-
-			Ok(Response::from_parts(parts, Full::new(body)))
+		let Either::Left(socket) = parts.io else {
+			unreachable!("just checked that it is the plaintext arm")
 		};
 
-		let mut fut = pin!(fut);
-		let mut conn = pin!(conn);
+		let mut upgraded =
+			FramedParts::new::<Message>(Either::Right(secure(socket, keys)), parts.codec);
+		upgraded.read_buf = parts.read_buf;
+		upgraded.write_buf = parts.write_buf;
 
-		select! {
-			biased;
-			x = &mut fut => x,
-			x = &mut conn => {
-				// if it hits eof it will return Ok. let it continue then
-				x.context("control connection failed")?;
-				fut.await
-			}
-		}
+		self.channel = Some(Channel::from_parts(upgraded, cseq));
+
+		Ok(())
 	}
 
-	pub async fn pair_setup(&mut self, identity: &Identity) -> Result<Pairing> {
+	fn channel(&mut self) -> Result<&mut Channel<Transport>> {
+		self.channel
+			.as_mut()
+			.context("connection was left in a broken state")
+	}
+
+	pub async fn request(&mut self, request: Request) -> Result<Response> {
+		let request = request
+			.header("User-Agent", USER_AGENT)
+			.header("X-Apple-ProtocolVersion", "1");
+
+		self.channel()?
+			.request(request)
+			.await
+			.context("control request failed")
+	}
+
+	pub async fn req<R: DeserializeOwned>(
+		&mut self,
+		method: Method,
+		path: &str,
+		body: &impl Serialize,
+	) -> Result<R> {
+		let res = self
+			.request(Request::new(method, path).body(
+				proto::CONTENT_TYPE,
+				proto::to_binary(body).context("failed to serialize body")?,
+			))
+			.await
+			.context("failed to send post")?;
+
+		if !res.is_success() {
+			bail!("failed to POST {path}");
+		}
+
+		proto::from_binary(&res.body)
+	}
+
+	pub async fn next_request(&mut self) -> Result<Option<Request>> {
+		self.channel()?
+			.next_request()
+			.await
+			.context("failed to read an accessory request")
+	}
+
+	pub async fn respond(&mut self, to: &Request, response: Response) -> Result<()> {
+		self.channel()?
+			.respond(to, response)
+			.await
+			.context("failed to answer an accessory request")
+	}
+
+	async fn req_post(&mut self, path: &str, content_type: &str, body: Vec<u8>) -> Result<Bytes> {
+		let response = self
+			.request(Request::new(Method::Post, path).body(content_type, body))
+			.await
+			.with_context(|| format!("failed to POST {path}"))?;
+
+		if !response.is_success() {
+			bail!("{path} returned {} {}", response.status, response.reason);
+		}
+
+		Ok(response.body)
+	}
+
+	pub async fn pair_setup(&mut self, identity: &PairIdentity) -> Result<Pairing> {
 		let mut setup = PairSetup::new(identity, CARPLAY_PIN);
-		let mut post = async |body: Vec<u8>| {
-			let res = self
-				.http_req(
-					Request::post("/pair-setup")
-						.header(header::HOST, "carplay")
-						.header(header::CONTENT_TYPE, "application/pairing+tlv8")
-						.body(Full::new(Bytes::from(body)))
-						.context("failed to create req")?,
-				)
-				.await
-				.context("failed to send req")?;
-			if !res.status().is_success() {
-				bail!("pair-setup returned {}", res.status());
-			}
-			res.into_body().into_inner().context("failed to get body")
-		};
+		let mut post = async |body: Vec<u8>| self.req_post("/pair-setup", PAIRING_TLV8, body).await;
 
 		let m1 = setup.m1();
 		let m2 = post(m1).await.context("failed to send m1")?;
@@ -152,31 +149,17 @@ impl HeadUnitTcpConnection {
 
 	pub async fn pair_verify(
 		&mut self,
-		identity: &Identity,
+		identity: &PairIdentity,
 		ltpk: AccessoryLTPK,
 	) -> Result<[u8; 32]> {
 		let mut verify = PairVerify::new(identity, ltpk);
-		let mut post = async |body: Vec<u8>| {
-			let res = self
-				.http_req(
-					Request::post("/pair-verify")
-						.header(header::HOST, "carplay")
-						.header(header::CONTENT_TYPE, "application/pairing+tlv8")
-						.body(Full::new(Bytes::from(body)))
-						.context("failed to create req")?,
-				)
-				.await
-				.context("failed to send req")?;
-			if !res.status().is_success() {
-				bail!("pair-verify returned {}", res.status());
-			}
-			res.into_body().into_inner().context("failed to get body")
-		};
+		let mut post =
+			async |body: Vec<u8>| self.req_post("/pair-verify", PAIRING_TLV8, body).await;
 
 		let m1 = verify.m1();
 		let m2 = post(m1).await.context("failed to send m1")?;
 		let m3 = verify.m3(&m2).context("failed to parse m2")?;
-		let m4 = post(m3).await.context("Failed to send m3")?;
+		let m4 = post(m3).await.context("failed to send m3")?;
 
 		verify.finish(&m4).context("failed to finish verifying")
 	}
@@ -184,22 +167,10 @@ impl HeadUnitTcpConnection {
 	pub async fn mfi_auth(&mut self) -> Result<AccessoryAuth> {
 		let auth = AuthSetup::new();
 
-		let res = self
-			.http_req(
-				Request::post("/auth-setup")
-					.header(header::HOST, "carplay")
-					.header(header::CONTENT_TYPE, "application/octet-stream")
-					.body(Full::new(Bytes::from(auth.request())))
-					.context("failed to build request")?,
-			)
+		let body = self
+			.req_post("/auth-setup", OCTET_STREAM, auth.request())
 			.await
-			.context("failed to send request")?;
-
-		if !res.status().is_success() {
-			bail!("auth-setup returned {}", res.status());
-		}
-
-		let body = res.into_body().into_inner().context("failed to get body")?;
+			.context("failed to exchange auth-setup")?;
 
 		auth.process_response(&body)
 			.context("failed to process auth response")
@@ -208,181 +179,219 @@ impl HeadUnitTcpConnection {
 
 #[cfg(test)]
 mod tests {
-	use std::{
-		net::{Ipv6Addr, SocketAddrV6},
-		time::Duration,
-	};
+	use std::net::{Ipv6Addr, SocketAddrV6};
 
+	use futures::{SinkExt, StreamExt};
 	use tokio::{
-		io::{AsyncReadExt, AsyncWriteExt},
+		io::{AsyncRead, AsyncWrite},
 		net::TcpListener,
 	};
+	use tokio_util::codec::Framed;
 
 	use super::*;
+	use crate::carplay::net::rtsp;
 
-	/// Read one HTTP message off `io`, honouring Content-Length.
-	async fn read_message<R: tokio::io::AsyncRead + Unpin>(io: &mut R) -> Result<Vec<u8>> {
-		let mut buf = Vec::new();
-		let head_end = loop {
-			if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-				break at + 4;
+	/// Answer `count` requests with `reply-<n>`, collecting the `CSeq` of each.
+	///
+	/// Using the codec on both sides is deliberate: it exercises the encoder in the
+	/// direction the accessory writes, which is what the event channel depends on.
+	async fn scripted_accessory<T: AsyncRead + AsyncWrite + Unpin>(
+		io: T,
+		count: usize,
+	) -> Vec<Option<u32>> {
+		let mut framed = Framed::new(io, rtsp::Codec::new());
+		let mut seen = Vec::new();
+
+		for index in 0..count {
+			let Some(Ok(Message::Request(request))) = framed.next().await else {
+				break;
+			};
+			seen.push(request.cseq());
+
+			let mut response = Response::ok().body("text/plain", format!("reply-{index}"));
+			if let Some(cseq) = request.cseq() {
+				response.headers.insert("CSeq", cseq.to_string());
 			}
-			let mut byte = [0u8; 1];
-			if io.read(&mut byte).await? == 0 {
-				bail!("peer closed mid-header");
-			}
-			buf.push(byte[0]);
-		};
-
-		let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
-		let len = head
-			.lines()
-			.find_map(|l| l.strip_prefix("content-length:"))
-			.and_then(|v| v.trim().parse::<usize>().ok())
-			.unwrap_or(0);
-
-		let mut body = vec![0u8; len];
-		io.read_exact(&mut body).await?;
-		buf.extend_from_slice(&body);
-		Ok(buf)
-	}
-
-	fn response(body: &str) -> Vec<u8> {
-		format!(
-			"HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-			body.len()
-		)
-		.into_bytes()
-	}
-
-	async fn request(conn: &mut HeadUnitTcpConnection, path: &str) -> Result<String> {
-		let res = conn
-			.http_req(
-				Request::post(path)
-					.header(header::HOST, "carplay")
-					.body(Full::new(Bytes::from_static(b"ping")))?,
-			)
-			.await?;
-		let body = res.into_body().into_inner().context("no body")?;
-		Ok(String::from_utf8_lossy(&body).to_string())
-	}
-
-	/// The plaintext phase: pair-setup and pair-verify are six POSTs on one socket, each
-	/// built from a fresh hyper handshake. Nothing may be stranded between them.
-	#[tokio::test]
-	async fn six_requests_share_one_plaintext_connection() {
-		let listener = TcpListener::bind("[::1]:0").await.unwrap();
-		let port = listener.local_addr().unwrap().port();
-
-		let server = tokio::spawn(async move {
-			let (mut io, _) = listener.accept().await.unwrap();
-			for i in 0..6 {
-				read_message(&mut io).await.unwrap();
-				io.write_all(&response(&format!("reply-{i}")))
-					.await
-					.unwrap();
-			}
-		});
-
-		let mut conn =
-			HeadUnitTcpConnection::new(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0))
-				.await
-				.unwrap();
-
-		for i in 0..6 {
-			let body = request(&mut conn, "/pair-setup")
-				.await
-				.unwrap_or_else(|e| panic!("request {i} failed: {e:?}"));
-			assert_eq!(body, format!("reply-{i}"), "request {i}");
+			framed.send(Message::Response(response)).await.unwrap();
 		}
 
-		server.await.unwrap();
+		seen
 	}
 
-	/// The same, but after upgrade(): every byte now crosses the frame codec, which adds
-	/// its own buffering underneath hyper.
-	#[tokio::test]
-	async fn six_requests_survive_the_encrypted_upgrade() {
+	async fn listen() -> (TcpListener, SocketAddrV6) {
 		let listener = TcpListener::bind("[::1]:0").await.unwrap();
 		let port = listener.local_addr().unwrap().port();
+		(listener, SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0))
+	}
 
-		let secret = [0x5Au8; 32];
-		let ours = SessionKeys::control(&secret);
-		// The accessory's read key is our write key and vice versa.
-		let theirs = SessionKeys {
+	/// Keys as the accessory sees them: its read key is our write key and vice versa.
+	fn mirrored(ours: SessionKeys) -> SessionKeys {
+		SessionKeys {
 			read: ours.write,
 			write: ours.read,
-		};
-
-		let server = tokio::spawn(async move {
-			let (io, _) = listener.accept().await.unwrap();
-			let mut io = secure(io, theirs);
-			for i in 0..6 {
-				read_message(&mut io).await.unwrap();
-				io.write_all(&response(&format!("sealed-{i}")))
-					.await
-					.unwrap();
-				io.flush().await.unwrap();
-			}
-		});
-
-		let mut conn =
-			HeadUnitTcpConnection::new(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0))
-				.await
-				.unwrap();
-		conn.upgrade(ours).unwrap();
-
-		for i in 0..6 {
-			let body = request(&mut conn, "/info").await.unwrap();
-			assert_eq!(body, format!("sealed-{i}"), "request {i}");
 		}
-
-		server.await.unwrap();
 	}
 
-	/// A peer that writes ahead is rejected, not silently mis-parsed.
-	///
-	/// This is the one case where bytes could be stranded: each http_req builds a fresh
-	/// hyper handshake and drops it, so anything hyper read past the end of the response
-	/// would die with its buffer. In practice hyper notices the extra message and fails
-	/// the connection with "received unexpected message from connection", so the failure
-	/// is loud rather than silent corruption.
-	///
-	/// CarPlay's control connection is strict request/response -- the accessory pushes on
-	/// the event channel instead -- so this should not arise. The test pins the behaviour
-	/// in case a head unit ever does it.
+	async fn body_of(conn: &mut HeadUnitTcpConnection, path: &str) -> String {
+		let body = conn
+			.req_post(path, OCTET_STREAM, b"ping".to_vec())
+			.await
+			.unwrap();
+		String::from_utf8_lossy(&body).into_owned()
+	}
+
+	fn cseqs(range: std::ops::RangeInclusive<u32>) -> Vec<Option<u32>> {
+		range.map(Some).collect()
+	}
+
+	/// Pair-setup and pair-verify are six POSTs on one socket. Nothing may be stranded
+	/// between them, and each must carry the next `CSeq`.
 	#[tokio::test]
-	async fn a_peer_that_writes_ahead_is_rejected_loudly() {
-		let listener = TcpListener::bind("[::1]:0").await.unwrap();
-		let port = listener.local_addr().unwrap().port();
+	async fn six_requests_share_one_plaintext_connection() {
+		let (listener, addr) = listen().await;
 
-		let server = tokio::spawn(async move {
-			let (mut io, _) = listener.accept().await.unwrap();
-			read_message(&mut io).await.unwrap();
-
-			// Both responses in a single write, so they arrive together.
-			let mut both = response("first");
-			both.extend_from_slice(&response("second"));
-			io.write_all(&both).await.unwrap();
-
-			tokio::time::sleep(Duration::from_secs(2)).await;
+		let accessory = tokio::spawn(async move {
+			let (io, _) = listener.accept().await.unwrap();
+			scripted_accessory(io, 6).await
 		});
 
-		let mut conn =
-			HeadUnitTcpConnection::new(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0))
-				.await
-				.unwrap();
+		let mut conn = HeadUnitTcpConnection::new(addr).await.unwrap();
+		for index in 0..6 {
+			assert_eq!(
+				body_of(&mut conn, "/pair-setup").await,
+				format!("reply-{index}")
+			);
+		}
 
-		let err = tokio::time::timeout(Duration::from_millis(500), request(&mut conn, "/one"))
-			.await
-			.expect("should fail fast rather than hang")
-			.expect_err("a pipelined second response must not be accepted");
-
-		assert!(
-			format!("{err:#}").contains("unexpected message"),
-			"expected hyper to reject the extra message, got: {err:#}"
+		assert_eq!(
+			accessory.await.unwrap(),
+			cseqs(1..=6),
+			"CSeq runs for the life of the connection"
 		);
+	}
 
-		server.abort();
+	/// The same, but after `upgrade()`: every byte now crosses the frame codec, which adds
+	/// its own buffering underneath the message framing.
+	#[tokio::test]
+	async fn six_requests_survive_the_encrypted_upgrade() {
+		let (listener, addr) = listen().await;
+
+		let ours = SessionKeys::control(&[0x5Au8; 32]);
+		let theirs = mirrored(ours);
+
+		let accessory = tokio::spawn(async move {
+			let (io, _) = listener.accept().await.unwrap();
+			scripted_accessory(secure(io, theirs), 6).await
+		});
+
+		let mut conn = HeadUnitTcpConnection::new(addr).await.unwrap();
+		conn.upgrade(ours).unwrap();
+
+		for index in 0..6 {
+			assert_eq!(body_of(&mut conn, "/info").await, format!("reply-{index}"));
+		}
+
+		assert_eq!(accessory.await.unwrap(), cseqs(1..=6));
+	}
+
+	#[tokio::test]
+	async fn upgrading_twice_is_refused_without_losing_the_connection() {
+		let (listener, addr) = listen().await;
+
+		let ours = SessionKeys::control(&[0x11u8; 32]);
+		let theirs = mirrored(ours);
+
+		let accessory = tokio::spawn(async move {
+			let (io, _) = listener.accept().await.unwrap();
+			scripted_accessory(secure(io, theirs), 1).await
+		});
+
+		let mut conn = HeadUnitTcpConnection::new(addr).await.unwrap();
+		conn.upgrade(ours).unwrap();
+		assert!(conn.upgrade(ours).is_err(), "already encrypted");
+
+		// The refusal put the channel back, so the connection still works.
+		assert_eq!(body_of(&mut conn, "/info").await, "reply-0");
+		accessory.await.unwrap();
+	}
+
+	/// A peer that writes ahead used to be a hazard: every request built a fresh hyper
+	/// handshake and dropped it, so a response hyper had read past the end of the one it
+	/// was waiting for died with its buffer. Framing the connection once fixes that — the
+	/// second response is simply already there when we ask for it.
+	#[tokio::test]
+	async fn a_pipelined_response_is_buffered_not_dropped() {
+		let (listener, addr) = listen().await;
+
+		tokio::spawn(async move {
+			let (io, _) = listener.accept().await.unwrap();
+			let mut framed = Framed::new(io, rtsp::Codec::new());
+
+			// Wait for the first request, then answer it *and* the next one at once.
+			framed.next().await.unwrap().unwrap();
+
+			let mut first = Response::ok().body("text/plain", "first");
+			first.headers.insert("CSeq", "1");
+			let mut second = Response::ok().body("text/plain", "second");
+			second.headers.insert("CSeq", "2");
+
+			framed.feed(Message::Response(first)).await.unwrap();
+			framed.feed(Message::Response(second)).await.unwrap();
+			framed.flush().await.unwrap();
+
+			// Hold the connection open, so the client is not woken by an EOF instead.
+			std::future::pending::<()>().await;
+		});
+
+		let mut conn = HeadUnitTcpConnection::new(addr).await.unwrap();
+		assert_eq!(body_of(&mut conn, "/one").await, "first");
+		assert_eq!(
+			body_of(&mut conn, "/two").await,
+			"second",
+			"the pipelined response was buffered, not discarded"
+		);
+	}
+
+	/// The event channel: same type, same framing, requests running the other way.
+	#[tokio::test]
+	async fn the_same_connection_serves_accessory_requests() {
+		let (listener, addr) = listen().await;
+
+		let ours = SessionKeys::event(&[0x77u8; 32]);
+		let theirs = mirrored(ours);
+
+		let accessory = tokio::spawn(async move {
+			let (io, _) = listener.accept().await.unwrap();
+			let mut framed = Framed::new(secure(io, theirs), rtsp::Codec::new());
+
+			let mut request = Request::new(Method::Post, "/command")
+				.version(rtsp::Version::Http11)
+				.body("application/x-apple-binary-plist", &b"bplist00"[..]);
+			request.headers.insert("CSeq", "9");
+
+			framed.send(Message::Request(request)).await.unwrap();
+
+			let Some(Ok(Message::Response(response))) = framed.next().await else {
+				panic!("expected a response");
+			};
+			response
+		});
+
+		let mut conn = HeadUnitTcpConnection::new(addr).await.unwrap();
+		conn.upgrade(ours).unwrap();
+
+		let request = conn.next_request().await.unwrap().unwrap();
+		assert_eq!(request.target, "/command");
+		assert_eq!(&request.body[..], b"bplist00");
+
+		conn.respond(&request, Response::ok()).await.unwrap();
+
+		let response = accessory.await.unwrap();
+		assert_eq!(response.cseq(), Some(9), "CSeq is echoed");
+		assert_eq!(
+			response.version,
+			rtsp::Version::Http11,
+			"and so is the protocol version"
+		);
 	}
 }

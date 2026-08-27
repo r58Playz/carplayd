@@ -16,7 +16,14 @@ use rtnetlink::{
 };
 use tokio::fs::read_dir;
 
-use crate::carplay::usb::head_unit::HeadUnitUsb;
+use crate::carplay::{MacAddr, usb::head_unit::HeadUnitUsb};
+
+#[derive(Clone, Copy, Debug)]
+pub struct NcmLink {
+	pub ip: Ipv6Addr,
+	pub scope_id: u32,
+	pub mac: MacAddr,
+}
 
 pub async fn get_ncm_device_name(head_unit: &HeadUnitUsb) -> Result<String> {
 	let active_config = head_unit
@@ -50,7 +57,7 @@ pub async fn get_ncm_device_name(head_unit: &HeadUnitUsb) -> Result<String> {
 	Ok(ncm_device.file_name().to_string_lossy().into_owned())
 }
 
-pub async fn configure_ncm(device: &str) -> Result<(Ipv6Addr, u32)> {
+pub async fn configure_ncm(device: &str) -> Result<NcmLink> {
 	let (conn, handle, mut events) =
 		rtnetlink::new_multicast_connection(&[MulticastGroup::Ipv6Ifaddr])
 			.context("failed to create rtnetlink conn")?;
@@ -65,6 +72,18 @@ pub async fn configure_ncm(device: &str) -> Result<(Ipv6Addr, u32)> {
 			.await
 			.context("no link found for device")?
 			.context("failed to get link for device")?;
+
+		let mac = link
+			.attributes
+			.iter()
+			.find_map(|x| {
+				if let LinkAttribute::Address(addr) = x {
+					MacAddr::try_from(addr.as_slice()).ok()
+				} else {
+					None
+				}
+			})
+			.context("no hardware address on the ncm link")?;
 
 		let mut dev_conf = *link
 			.attributes
@@ -136,7 +155,11 @@ pub async fn configure_ncm(device: &str) -> Result<(Ipv6Addr, u32)> {
 					continue;
 				};
 
-				return Ok((v6, link.header.index));
+				return Ok(NcmLink {
+					ip: v6,
+					scope_id: link.header.index,
+					mac,
+				});
 			}
 		}
 

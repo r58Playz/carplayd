@@ -16,7 +16,7 @@ use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::pairing::{
-	identity::{Identity, verify_signature},
+	identity::{PairIdentity, verify_signature},
 	keys::{open_sub_tlv, pair_verify_session_key, pairing_nonce, seal},
 	setup::AccessoryLTPK,
 	tlv8::{Tlv8, ty},
@@ -24,7 +24,7 @@ use crate::pairing::{
 
 /// Pair-verify driven one message at a time; the caller does the POSTing.
 pub struct PairVerify<'a> {
-	identity: &'a Identity,
+	identity: &'a PairIdentity,
 	accessory_ltpk: AccessoryLTPK,
 	secret: StaticSecret,
 	public_key: PublicKey,
@@ -34,7 +34,7 @@ pub struct PairVerify<'a> {
 
 impl<'a> PairVerify<'a> {
 	/// Start a verify against an accessory whose long-term key we already stored.
-	pub fn new(identity: &'a Identity, accessory_ltpk: AccessoryLTPK) -> Self {
+	pub fn new(identity: &'a PairIdentity, accessory_ltpk: AccessoryLTPK) -> Self {
 		let secret = StaticSecret::random_from_rng(OsRng);
 		let public_key = PublicKey::from(&secret);
 
@@ -146,7 +146,7 @@ mod tests {
 
 	#[test]
 	fn m1_offers_a_32_byte_public_key() {
-		let identity = Identity::generate();
+		let identity = PairIdentity::generate();
 		let verify = PairVerify::new(&identity, [0u8; 32]);
 
 		let tlv = Tlv8::parse(&verify.m1()).unwrap();
@@ -158,8 +158,8 @@ mod tests {
 	/// orderings and the fact that both sides land on the same shared secret.
 	#[test]
 	fn completes_against_a_reference_accessory() {
-		let device = Identity::generate();
-		let accessory = Identity::generate();
+		let device = PairIdentity::generate();
+		let accessory = PairIdentity::generate();
 		let accessory_id = accessory.pairing_id().to_string();
 
 		let mut verify = PairVerify::new(&device, accessory.public_key());
@@ -232,9 +232,9 @@ mod tests {
 
 	#[test]
 	fn rejects_a_signature_from_the_wrong_accessory() {
-		let device = Identity::generate();
-		let accessory = Identity::generate();
-		let impostor = Identity::generate();
+		let device = PairIdentity::generate();
+		let accessory = PairIdentity::generate();
+		let impostor = PairIdentity::generate();
 
 		let mut verify = PairVerify::new(&device, accessory.public_key());
 		let m1 = Tlv8::parse(&verify.m1()).unwrap();
