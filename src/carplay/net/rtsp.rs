@@ -88,7 +88,11 @@ pub enum Version {
 	/// What the control connection speaks.
 	#[default]
 	Rtsp10,
-	/// What the reference implementation's event channel appears to speak.
+	/// What the event channel speaks. Not a typo for `HTTP/1.0`: the reference
+	/// implementation carries the literal `EVENT/1.0` in the same string block as the rest
+	/// of its event HTTP client, and R29 does not mention it at all. **[V]**
+	Event10,
+	/// Ordinary HTTP, which `CarPlayEventHTTPClient.c` is built on top of.
 	Http11,
 }
 
@@ -96,6 +100,7 @@ impl Version {
 	pub fn as_str(self) -> &'static str {
 		match self {
 			Self::Rtsp10 => "RTSP/1.0",
+			Self::Event10 => "EVENT/1.0",
 			Self::Http11 => "HTTP/1.1",
 		}
 	}
@@ -106,6 +111,7 @@ impl Version {
 	fn parse(token: &str) -> Option<Self> {
 		match token {
 			"RTSP/1.0" => Some(Self::Rtsp10),
+			"EVENT/1.0" => Some(Self::Event10),
 			"HTTP/1.1" | "HTTP/1.0" => Some(Self::Http11),
 			_ => None,
 		}
@@ -750,6 +756,27 @@ mod tests {
 
 		let encoded = encode(Request::new(Method::Post, "/event").version(Version::Http11));
 		assert!(encoded.starts_with(b"POST /event HTTP/1.1\r\n"));
+	}
+
+	/// What the event channel actually speaks. `EVENT/1.0` is in no revision of the spec —
+	/// it comes out of the reference implementation — and a version we cannot parse turns
+	/// every `changeModes` the head unit sends into a dead connection.
+	#[test]
+	fn the_event_channel_speaks_event_1_0() {
+		let Message::Request(request) =
+			decode_one(b"POST /command EVENT/1.0\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n")
+		else {
+			panic!("should be a request");
+		};
+
+		assert_eq!(request.version, Version::Event10);
+		assert_eq!(request.target, "/command");
+
+		let encoded = encode(Response::ok().version(request.version));
+		assert!(
+			encoded.starts_with(b"EVENT/1.0 200 OK\r\n"),
+			"the answer has to go back in the version it arrived in"
+		);
 	}
 
 	#[test]

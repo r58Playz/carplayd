@@ -9,7 +9,7 @@ use crate::{
 			head_unit::HeadUnitServer,
 			timing::{Clock, TimingServer},
 		},
-		usb::{CarplayUsbSession, head_unit::HeadUnitUsb, ncm::NcmLink},
+		usb::ncm::NcmLink,
 	},
 	pairing::identity::{PairIdentity, PairingStore},
 };
@@ -20,11 +20,11 @@ pub mod usb;
 
 pub type MacAddr = [u8; 6];
 
-pub const CARPLAY_SESSION_ID: &str = "67676767-6767-4676-a767-676767676767";
+pub const CARPLAY_SESSION_ID: u64 = 676767676767676767;
 pub const CARPLAY_DEVICE_NAME: &str = "carplayd";
 pub const CARPLAY_MODEL: &str = "iPhone10,2";
-pub const CARPLAY_OS_BUILD_VERSION: &str = "67F67";
-pub const CARPLAY_SOURCE_VERSION: &str = "670.67.67";
+pub const CARPLAY_OS_BUILD_VERSION: &str = "20H350";
+pub const CARPLAY_SOURCE_VERSION: &str = "695.5.1";
 
 pub fn format_mac_lower(mac: MacAddr) -> String {
 	mac.map(|byte| format!("{byte:02x}")).join(":")
@@ -64,9 +64,8 @@ impl CarplaySession {
 		device_id: MacAddr,
 		link: NcmLink,
 
-		head_unit_usb: HeadUnitUsb,
 		head_unit_net: HeadUnitServer,
-	) -> Result<(Self, CarplayUsbSession, CarplayNetSession)> {
+	) -> Result<(Self, CarplayNetSession)> {
 		let timing_port = 6768;
 		let clock = Clock::new();
 		let device = DeviceIdentity {
@@ -81,16 +80,12 @@ impl CarplaySession {
 				.run(),
 		);
 
-		// iAP2 first, relax this once pairing is known good
-		let usb = CarplayUsbSession::new(&head_unit_usb)
-			.await
-			.context("failed to establish the iAP2 session")?;
+		let net =
+			CarplayNetSession::new(pair_identity, pairing, head_unit_net, device, timing_port)
+				.await
+				.context("failed to establish the CarPlay session")?;
 
-		let net = CarplayNetSession::new(pair_identity, pairing, head_unit_net, device, timing_port)
-			.await
-			.context("failed to establish the CarPlay session")?;
-
-		Ok((Self { clock, device }, usb, net))
+		Ok((Self { clock, device }, net))
 	}
 
 	pub async fn run(self) -> Result<()> {

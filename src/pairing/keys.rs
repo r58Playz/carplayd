@@ -97,23 +97,42 @@ impl SessionKeys {
 
 	/// Keys for the event connection (§30.3.2.2.1).
 	///
+	/// # The strings are plural
+	///
+	/// R29 prints these as `"Event-Salt"`, `"Event-Read-Encryption-Key"` and
+	/// `"Event-Write-Encryption-Key"`. **The spec is wrong.** Both sides of the shipping
+	/// implementation — `fakeiOSDevice` (device) and `AppleCarPlay` (receiver) — carry
+	/// `"Events-Salt"`, `"Events-Read-Encryption-Key"` and `"Events-Write-Encryption-Key"`,
+	/// and neither binary contains the singular form anywhere. **[V]**
+	///
+	/// Getting this wrong derives keys that are simply different, so pair-verify succeeds,
+	/// the control channel works, and then the very first frame the accessory sends on the
+	/// event channel fails its Poly1305 tag.
+	///
+	/// # And the roles are swapped
+	///
 	/// Note the swap against [`Self::control`]. The spec's note reads: on the control
 	/// connection the accessory "uses the write key for reading requests and the read key
 	/// for writing responses"; on the event connection it "uses the read key for reading
-	/// responses and the write key for writing requests".
+	/// responses and the write key for writing requests". The event channel reverses who
+	/// sends requests, so it reverses which key each end uses.
 	///
-	/// Line those two clauses up and the rule is that the key follows the *message type*,
-	/// not the socket direction — requests are always sealed under
-	/// `*-Write-Encryption-Key` and responses under `*-Read-Encryption-Key`, named for the
-	/// device, which normally writes requests and reads responses. The event channel
-	/// reverses who sends requests, so it reverses which key each end uses.
+	/// Confirmed in `_SetEventClientSecurityKeys`, which derives both keys and then hands
+	/// them to the same `(delegate, logCategory, readKey, readNonce, writeKey, writeNonce)`
+	/// call the control path uses — with the **write**-named key in the `readKey` position
+	/// and the **read**-named key in `writeKey`, the exact opposite of the control setup a
+	/// few hundred bytes away. **[V]**
 	///
-	/// We are the HTTP server here, so we decrypt the accessory's requests with the
-	/// write-named key and encrypt our responses with the read-named key.
+	/// We are the server here, so we decrypt the accessory's requests with the write-named
+	/// key and encrypt our responses with the read-named key.
 	pub fn event(shared_secret: &[u8; 32]) -> Self {
 		Self {
-			read: derive(shared_secret, b"Event-Salt", b"Event-Write-Encryption-Key"),
-			write: derive(shared_secret, b"Event-Salt", b"Event-Read-Encryption-Key"),
+			read: derive(
+				shared_secret,
+				b"Events-Salt",
+				b"Events-Write-Encryption-Key",
+			),
+			write: derive(shared_secret, b"Events-Salt", b"Events-Read-Encryption-Key"),
 		}
 	}
 
@@ -215,12 +234,12 @@ mod tests {
 
 		assert_eq!(
 			event.read,
-			derive(&secret, b"Event-Salt", b"Event-Write-Encryption-Key"),
+			derive(&secret, b"Events-Salt", b"Events-Write-Encryption-Key"),
 			"we decrypt the accessory's requests with the write-named key"
 		);
 		assert_eq!(
 			event.write,
-			derive(&secret, b"Event-Salt", b"Event-Read-Encryption-Key"),
+			derive(&secret, b"Events-Salt", b"Events-Read-Encryption-Key"),
 			"we encrypt our responses with the read-named key"
 		);
 
@@ -229,6 +248,21 @@ mod tests {
 			control.read,
 			derive(&secret, b"Control-Salt", b"Control-Read-Encryption-Key"),
 			"the control channel is not swapped"
+		);
+	}
+
+	/// R29 §30.3.2.2.1 spells these without the `s`, and the shipping firmware on both
+	/// sides spells them with it. The spec loses; this pins which one we follow, because
+	/// the failure it causes points at everything except the string.
+	#[test]
+	fn the_event_salt_is_plural() {
+		let secret = [7u8; 32];
+		let event = SessionKeys::event(&secret);
+
+		assert_ne!(
+			event.read,
+			derive(&secret, b"Event-Salt", b"Event-Write-Encryption-Key"),
+			"the singular spelling out of R29 is not what the accessory uses"
 		);
 	}
 

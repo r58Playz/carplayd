@@ -88,6 +88,8 @@ mod param {
 	pub const DEVICE_NAME: u16 = 0;
 	/// `DeviceLanguageUpdate` (§97.8.2).
 	pub const DEVICE_LANGUAGE: u16 = 0;
+	/// `DeviceUUIDUpdate` (§97.8.4).
+	pub const DEVICE_UUID: u16 = 0;
 	/// `DeviceTimeUpdate` (§97.8.3).
 	pub const SECONDS_SINCE_REFERENCE_DATE: u16 = 0;
 	pub const TIME_ZONE_OFFSET_MINUTES: u16 = 1;
@@ -113,6 +115,10 @@ pub struct DeviceProfile {
 	pub language: String,
 	/// Current we draw from the accessory, in mA. Matches the gadget's `MaxPower`.
 	pub max_current_ma: u16,
+	/// `DeviceUUID`, which §33.2 says stays constant for as long as any iAP2 accessory is
+	/// connected. A head unit may key its CarPlay device list off this, so it should be
+	/// stable per box — derive it from the serial number rather than leaving the default.
+	pub device_uuid: String,
 	/// The `USBTransportIdentifier` for `DeviceTransportIdentifierNotification`.
 	///
 	/// Only meaningful before the role switch, where it lets the accessory rule out an
@@ -129,6 +135,7 @@ impl Default for DeviceProfile {
 			name: "iPhone".into(),
 			language: "en".into(),
 			max_current_ma: 500,
+			device_uuid: "67676767-6767-4767-8767-676767676767".into(),
 			usb_transport_identifier: None,
 			challenge: Bytes::from_static(&[0xA5; 20]),
 		}
@@ -267,6 +274,13 @@ pub fn power_update(cx: Context<'_>) -> Message {
 
 /// The unsolicited notifications a device sends once identification is accepted (§97.8).
 /// None of these are gated by a `Start*` request.
+///
+/// §33.2: "The device will automatically send update messages if the accessory claims to
+/// receive them during Accessory Identification." That is a filter in both directions, so
+/// every candidate here is checked against parameter 7 before it goes out. It matters for
+/// `WirelessCarPlayUpdate`, which §33.2 says only accessories doing CarPlay over *both*
+/// wired and wireless should subscribe to — a wired-only head unit does not ask for it,
+/// and sending it anyway is a message it never agreed to parse.
 pub fn device_notifications(cx: Context<'_>) -> Vec<Message> {
 	let mut out = vec![
 		Message::new(ids::ID_DEVICE_INFORMATION_UPDATE)
@@ -274,8 +288,8 @@ pub fn device_notifications(cx: Context<'_>) -> Vec<Message> {
 		Message::new(ids::ID_DEVICE_LANGUAGE_UPDATE)
 			.param(Param::utf8(param::DEVICE_LANGUAGE, &cx.profile.language)),
 		device_time_update(),
-		// We are wired-only, and saying so is what stops the head unit waiting for a
-		// wireless handoff (Table 97-92).
+		Message::new(ids::ID_DEVICE_UUID_UPDATE)
+			.param(Param::utf8(param::DEVICE_UUID, &cx.profile.device_uuid)),
 		Message::new(ids::ID_WIRELESS_CAR_PLAY_UPDATE).param(Param::u8_(
 			param::WIRELESS_CARPLAY_STATUS,
 			WIRELESS_CARPLAY_UNAVAILABLE,
@@ -287,6 +301,7 @@ pub fn device_notifications(cx: Context<'_>) -> Vec<Message> {
 				.param(Param::utf8(param::USB_TRANSPORT_IDENTIFIER, id)),
 		);
 	}
+	out.retain(|msg| cx.accessory_expects(msg.id));
 	out
 }
 
@@ -1011,12 +1026,13 @@ mod tests {
 				ids::ID_AUTHENTICATION_SUCCEEDED,
 				ids::ID_START_IDENTIFICATION,
 				ids::ID_IDENTIFICATION_ACCEPTED,
-				// The five-message burst that follows identification must all get through
-				// without stalling on the send window.
+				// The burst that follows identification must all get through without
+				// stalling on the send window — and must contain only what the accessory
+				// subscribed to, so `WirelessCarPlayUpdate` is absent here.
 				ids::ID_DEVICE_INFORMATION_UPDATE,
 				ids::ID_DEVICE_LANGUAGE_UPDATE,
 				ids::ID_DEVICE_TIME_UPDATE,
-				ids::ID_WIRELESS_CAR_PLAY_UPDATE,
+				ids::ID_DEVICE_UUID_UPDATE,
 				ids::ID_POWER_UPDATE,
 			]
 		);
@@ -1054,9 +1070,18 @@ mod tests {
 					ids::ID_START_NOW_PLAYING_UPDATES,
 				]),
 			))
+			// Mirrors what a wired-only head unit declares: the three device notifications
+			// plus the UUID, and deliberately *not* `WirelessCarPlayUpdate` (§33.2).
 			.param(Param::blob(
 				ident::MESSAGES_RECEIVED_FROM_DEVICE,
-				messages(&[ids::ID_POWER_UPDATE, ids::ID_DEVICE_TIME_UPDATE, 0xFFFF]),
+				messages(&[
+					ids::ID_POWER_UPDATE,
+					ids::ID_DEVICE_INFORMATION_UPDATE,
+					ids::ID_DEVICE_LANGUAGE_UPDATE,
+					ids::ID_DEVICE_TIME_UPDATE,
+					ids::ID_DEVICE_UUID_UPDATE,
+					0xFFFF,
+				]),
 			))
 			.param(Param::utf8(ident::CURRENT_LANGUAGE, "en"))
 			.param(Param::group(

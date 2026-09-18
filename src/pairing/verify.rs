@@ -117,8 +117,11 @@ impl<'a> PairVerify<'a> {
 		self.shared_secret = Some(shared_secret);
 
 		let mut tlv = Tlv8::new();
-		tlv.push_u8(ty::STATE, 3)
-			.push(ty::ENCRYPTED_DATA, encrypted);
+		// EncryptedData before State, which is the order an iOS 16.7 trace puts M3 on the
+		// wire (`05 78 <120 bytes> 06 01 03`). M1 is the other way round there — State then
+		// Public Key — so this is not a general rule, it is what the reference does.
+		tlv.push(ty::ENCRYPTED_DATA, encrypted)
+			.push_u8(ty::STATE, 3);
 
 		Ok(tlv.encode())
 	}

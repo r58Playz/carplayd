@@ -131,6 +131,7 @@ pub struct AppStateChange {
 	/// Required when `app_state_id` is [`AppStateId::PhoneCall`] or
 	/// [`AppStateId::TurnByTurn`].
 	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub state: Option<bool>,
 }
 

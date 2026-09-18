@@ -18,7 +18,9 @@ use rand::{RngCore, rngs::OsRng};
 use tokio::fs;
 
 /// Format 16 random bytes the way iOS formats its pairing identifier.
-fn random_uuid() -> String {
+///
+/// Also used for `sessionUUID` in `SETUP`, which has the same shape.
+pub fn random_uuid() -> String {
 	let mut bytes = [0u8; 16];
 	OsRng.fill_bytes(&mut bytes);
 

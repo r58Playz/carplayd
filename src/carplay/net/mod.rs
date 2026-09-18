@@ -19,7 +19,7 @@ use crate::{
 		},
 	},
 	pairing::{
-		identity::{PairIdentity, PairingStore},
+		identity::{PairIdentity, PairingStore, random_uuid},
 		keys::SessionKeys,
 	},
 };
@@ -84,11 +84,6 @@ impl CarplayNetSession {
 
 		control.mfi_auth().await.context("failed to do mfi auth")?;
 
-		let info = control
-			.req::<AccessoryInfo>(Method::Get, "/info", &InfoRequest::all())
-			.await
-			.context("failed to GET /info")?;
-
 		let setup_req = SetupRequest {
 			device_id: format_mac_lower(identity.device_id),
 			mac_address: format_mac_upper(identity.mac_address),
@@ -97,16 +92,25 @@ impl CarplayNetSession {
 			os_build_version: CARPLAY_OS_BUILD_VERSION.to_string(),
 			source_version: CARPLAY_SOURCE_VERSION.to_string(),
 			timing_port,
-			features: None,
-			keep_alive_low_power: None,
+			features: Some(
+				["uiContext", "viewAreas", "cornerMasks", "focusTransfer"]
+					.map(str::to_string)
+					.to_vec(),
+			),
+			keep_alive_low_power: Some(false),
 
-			session_uuid: CARPLAY_SESSION_ID.to_string(),
+			session_uuid: random_uuid(),
 			streams: None,
 		};
 		let setup = control
-			.req::<SetupResponse>(Method::Setup, "/", &setup_req)
+			.req::<SetupResponse>(Method::Setup, &format!("rtsp://[{}]/{CARPLAY_SESSION_ID}", head_unit.addr.ip()), &setup_req)
 			.await
-			.context("failed to SETUP /")?;
+			.context("failed to SETUP target")?;
+
+		let info = control
+			.req::<AccessoryInfo>(Method::Get, "/info", &InfoRequest::all())
+			.await
+			.context("failed to GET /info")?;
 
 		let events_addr = SocketAddrV6::new(
 			*head_unit.addr.ip(),

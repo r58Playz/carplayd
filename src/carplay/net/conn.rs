@@ -1,16 +1,23 @@
-use std::net::SocketAddrV6;
+use std::{
+	net::SocketAddrV6,
+	time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use log::warn;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::net::TcpStream;
 use tokio_util::{codec::FramedParts, either::Either};
 
 use crate::{
-	carplay::net::{
-		codec::{Transport, secure},
-		proto,
-		rtsp::{Channel, Message, Method, Request, Response},
+	carplay::{
+		CARPLAY_DEVICE_NAME, CARPLAY_SOURCE_VERSION,
+		net::{
+			codec::{Transport, secure},
+			proto,
+			rtsp::{Channel, Message, Method, Request, Response},
+		},
 	},
 	pairing::{
 		auth_setup::{AccessoryAuth, AuthSetup},
@@ -21,12 +28,20 @@ use crate::{
 	},
 };
 
-const USER_AGENT: &str = "AirPlay/440.10";
+const APPLE_EPOCH_OFFSET: u64 = 978_307_200;
+fn apple_absolute_time() -> String {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_or(0, |d| d.as_secs())
+		.saturating_sub(APPLE_EPOCH_OFFSET)
+		.to_string()
+}
 
 const PAIRING_TLV8: &str = "application/pairing+tlv8";
 const OCTET_STREAM: &str = "application/octet-stream";
 
 pub struct HeadUnitTcpConnection {
+	ua: String,
 	channel: Option<Channel<Transport>>,
 }
 
@@ -39,6 +54,7 @@ impl HeadUnitTcpConnection {
 		stream.set_nodelay(true).context("failed to set nodelay")?;
 
 		Ok(Self {
+			ua: format!("AirPlay/{CARPLAY_SOURCE_VERSION}"),
 			channel: Some(Channel::new(Either::Left(stream))),
 		})
 	}
@@ -50,18 +66,20 @@ impl HeadUnitTcpConnection {
 			.context("connection was left in a broken state")?;
 		let (parts, cseq) = channel.into_parts();
 
-		if matches!(&parts.io, Either::Right(_)) {
-			self.channel = Some(Channel::from_parts(parts, cseq));
-			bail!("connection is already encrypted");
-		}
-		let Either::Left(socket) = parts.io else {
-			unreachable!("just checked that it is the plaintext arm")
-		};
+		let upgraded = match parts.io {
+			Either::Left(socket) => {
+				let mut upgraded =
+					FramedParts::new::<Message>(Either::Right(secure(socket, keys)), parts.codec);
+				upgraded.read_buf = parts.read_buf;
+				upgraded.write_buf = parts.write_buf;
 
-		let mut upgraded =
-			FramedParts::new::<Message>(Either::Right(secure(socket, keys)), parts.codec);
-		upgraded.read_buf = parts.read_buf;
-		upgraded.write_buf = parts.write_buf;
+				upgraded
+			}
+			Either::Right(_) => {
+				warn!("attempted to upgrade already upgraded connection");
+				parts
+			}
+		};
 
 		self.channel = Some(Channel::from_parts(upgraded, cseq));
 
@@ -76,8 +94,12 @@ impl HeadUnitTcpConnection {
 
 	pub async fn request(&mut self, request: Request) -> Result<Response> {
 		let request = request
-			.header("User-Agent", USER_AGENT)
-			.header("X-Apple-ProtocolVersion", "1");
+			.header("User-Agent", &self.ua)
+			.header("X-Apple-ProtocolVersion", "1")
+			.header("X-Apple-AbsoluteTime", apple_absolute_time())
+			.header("X-Apple-Client-Name", CARPLAY_DEVICE_NAME)
+			.header("X-Apple-PD", "1")
+			.header("X-Apple-HKP", "2");
 
 		self.channel()?
 			.request(request)
@@ -85,12 +107,12 @@ impl HeadUnitTcpConnection {
 			.context("control request failed")
 	}
 
-	pub async fn req<R: DeserializeOwned>(
+	pub async fn req_opt<R: DeserializeOwned>(
 		&mut self,
 		method: Method,
 		path: &str,
 		body: &impl Serialize,
-	) -> Result<R> {
+	) -> Result<Option<R>> {
 		let res = self
 			.request(Request::new(method, path).body(
 				proto::CONTENT_TYPE,
@@ -103,7 +125,19 @@ impl HeadUnitTcpConnection {
 			bail!("failed to POST {path}");
 		}
 
-		proto::from_binary(&res.body)
+		(!res.body.is_empty())
+			.then(|| proto::from_binary(&res.body))
+			.transpose()
+	}
+	pub async fn req<R: DeserializeOwned>(
+		&mut self,
+		method: Method,
+		path: &str,
+		body: &impl Serialize,
+	) -> Result<R> {
+		self.req_opt(method, path, body)
+			.await?
+			.with_context(|| format!("no body found for {path:?}"))
 	}
 
 	pub async fn next_request(&mut self) -> Result<Option<Request>> {

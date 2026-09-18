@@ -278,6 +278,11 @@ impl AccessoryCommand {
 #[serde(rename_all = "camelCase")]
 pub struct HidSendReport {
 	/// Matches a [`super::info::HidDevice::uuid`] from `/info`.
+	///
+	/// Some head units use a small integer for this identifier. Keep this in lockstep with
+	/// `HidDevice::uuid`, or the device can advertise successfully and then fail as soon as
+	/// it sends the first touch report.
+	#[serde(deserialize_with = "super::flexible::string")]
 	pub uuid: String,
 	/// A USB HID report, to be read against that device's descriptor. A VW head unit sends
 	/// five bytes: report ID, then X and Y as little-endian `u16` -- USB HID is always
@@ -348,6 +353,12 @@ fn string(dict: &Dictionary, key: &str) -> Option<String> {
 	Some(dict.get(key)?.as_string()?.to_owned())
 }
 
+/// Accessory commands carry booleans the same loose way `/info` does — `0` and `1` as
+/// integers — so accept either. See [`super::flexible`].
 fn boolean(dict: &Dictionary, key: &str) -> Option<bool> {
-	dict.get(key)?.as_boolean()
+	let value = dict.get(key)?;
+	value.as_boolean().or_else(|| {
+		let n = value.as_signed_integer()?;
+		Some(n != 0)
+	})
 }

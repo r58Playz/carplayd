@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use futures::{FutureExt, StreamExt, future::select};
+use log::debug;
 use rtnetlink::{
 	LinkUnspec, MulticastGroup,
 	packet_core::NetlinkPayload,
@@ -73,6 +74,11 @@ pub async fn configure_ncm(device: &str) -> Result<NcmLink> {
 			.context("no link found for device")?
 			.context("failed to get link for device")?;
 
+		debug!(
+			"ncm link {} index {} flags {:?}",
+			device, link.header.index, link.header.flags
+		);
+
 		let mac = link
 			.attributes
 			.iter()
@@ -110,24 +116,39 @@ pub async fn configure_ncm(device: &str) -> Result<NcmLink> {
 			.context("no devconf struct found for device")?;
 
 		dev_conf.accept_ra = 0;
+		dev_conf.accept_dad = 0;
+		dev_conf.dad_transmits = 0;
 		dev_conf.optimistic_dad = 1;
+		dev_conf.use_optimistic = 1;
 
 		let attr = LinkAttribute::AfSpecUnspec(vec![AfSpecUnspec::Inet6(vec![
 			AfSpecInet6::AddrGenMode(In6AddrGenMode::Eui64),
 			AfSpecInet6::DevConf(dev_conf),
 		])]);
 
+		// Two calls, not one. Bringing the link up is what makes the kernel derive the
+		// link-local address, and it does that with whatever devconf is in force at that
+		// moment — so the DAD settings have to already be committed. Folding `.up()` into
+		// the same message races the address against the configuration that governs it.
 		handle
 			.link()
 			.set(
 				LinkUnspec::new_with_index(link.header.index)
-					.up()
 					.append_extra_attribute(attr)
 					.build(),
 			)
 			.execute()
 			.await
-			.context("failed to set link attrs")?;
+			.context("failed to set link ipv6 attrs")?;
+		debug!("ncm ipv6 attrs committed");
+
+		handle
+			.link()
+			.set(LinkUnspec::new_with_index(link.header.index).up().build())
+			.execute()
+			.await
+			.context("failed to bring link up")?;
+		debug!("ncm link set up, waiting for a link-local address");
 
 		while let Some((msg, _)) = events.next().await {
 			if let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewAddress(addr_msg)) =
@@ -136,6 +157,18 @@ pub async fn configure_ncm(device: &str) -> Result<NcmLink> {
 				if addr_msg.header.index != link.header.index {
 					continue;
 				}
+
+				debug!(
+					"ncm address event: {:?}",
+					addr_msg
+						.attributes
+						.iter()
+						.filter(|x| matches!(
+							x,
+							AddressAttribute::Address(_) | AddressAttribute::Flags(_)
+						))
+						.collect::<Vec<_>>()
+				);
 
 				if addr_msg.attributes.iter().any(
 					|x| matches!(x, AddressAttribute::Flags(f) if f.contains(AddressFlags::Tentative)),

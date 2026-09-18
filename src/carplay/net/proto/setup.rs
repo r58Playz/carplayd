@@ -124,6 +124,7 @@ pub struct SetupRequest {
 	pub features: Option<Vec<String>>,
 	/// Whether we support the UDP idle keepalive (§30.3.2.9).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub keep_alive_low_power: Option<bool>,
 }
 
@@ -208,9 +209,11 @@ pub struct StreamRequest {
 	pub audio_type: Option<String>,
 	/// Debug only: loop output back as input.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub audio_loopback: Option<bool>,
 	/// Enable audio input. Main audio only.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub input: Option<bool>,
 	/// UDP port we listen on for RTCP. Main high audio only.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,6 +228,40 @@ pub struct StreamRequest {
 	/// the `vocoderInfo` extended feature.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub vocoder_info: Option<VocoderInfo>,
+}
+
+/// One stream named in a `TEARDOWN` body.
+///
+/// Only the type is needed: §30.3.2 step 9 has the device "end one or more streams on the
+/// accessory", and there is at most one stream of each type in a session.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamTeardown {
+	pub r#type: StreamType,
+}
+
+/// `TEARDOWN` (§30.3.2, steps 9 and 10).
+///
+/// With a `streams` array it ends those streams and leaves the session up; with no body at
+/// all it ends the whole session. Skipping it does not merely leak: the accessory keeps the
+/// stream it set up, and the *next* screen `SETUP` — when the user comes back to CarPlay —
+/// is answered `400 Bad Request`. Closing our own TCP socket tells it nothing.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeardownRequest {
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub streams: Option<Vec<StreamTeardown>>,
+}
+
+impl TeardownRequest {
+	/// End the screen stream, leaving the session running.
+	pub fn screen() -> Self {
+		Self {
+			streams: Some(vec![StreamTeardown {
+				r#type: StreamType::Screen,
+			}]),
+		}
+	}
 }
 
 impl StreamRequest {

@@ -13,10 +13,6 @@ use crate::carplay::{CARPLAY_SOURCE_VERSION, MacAddr, format_mac_upper};
 
 pub struct CarplayCtrlServer {
 	pub conn_tx: UnboundedSender<MacAddr>,
-	/// Advertised as `id` (Table 30-22). The spec calls this the device's Bluetooth MAC,
-	/// which we do not have — nothing over NCM resolves it as one, and the accessory's own
-	/// `connect` request carries its MAC rather than ours. What it does have to be is stable
-	/// and unique per box, since a head unit may key its device list off it.
 	pub device_id: MacAddr,
 	pub mdns: ServiceDaemon,
 	pub ip: Ipv6Addr,
@@ -83,15 +79,16 @@ impl CarplayCtrlServer {
 	pub async fn run(self) -> Result<()> {
 		let device_id = format_mac_upper(self.device_id);
 		let params: &[(&str, &str)] = &[("id", &device_id), ("srcvers", CARPLAY_SOURCE_VERSION)];
-		let service_info = ServiceInfo::new(
-			"_carplay-ctrl._tcp",
+		let mut service_info = ServiceInfo::new(
+			"_carplay-ctrl._tcp.local.",
 			"carplayd-ctrl",
-			"carplayd",
+			"carplayd.local.",
 			IpAddr::V6(self.ip),
 			self.port,
 			params,
 		)
 		.context("failed to create service info")?;
+		service_info.set_requires_probe(false);
 
 		let mut set = JoinSet::new();
 

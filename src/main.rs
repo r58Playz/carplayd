@@ -1,13 +1,13 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use futures::future::join;
 use log::{LevelFilter, debug, info, warn};
 use mdns_sd::{IfKind, ServiceDaemon};
 use tokio::{
 	fs,
 	sync::mpsc,
 	task::{JoinSet, spawn_blocking},
-	time::timeout,
 };
 
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
 		derive_device_id, format_mac_lower,
 		net::head_unit::find_head_unit_server,
 		usb::{
+			CarplayUsbSession,
 			dwc2::{Dwc2, Mode},
 			head_unit::{HeadUnitUsb, find_iap2_device},
 			ncm::{configure_ncm, get_ncm_device_name},
@@ -34,6 +35,20 @@ mod provider;
 
 const HEAD_UNIT_ATTEMPTS: u32 = 100;
 const HEAD_UNIT_INTERVAL: Duration = Duration::from_millis(10);
+
+async fn wrap(name: &'static str, fut: impl Future<Output = Result<()>>) -> Result<()> {
+	let ret = fut.await;
+	match ret {
+		Ok(()) => {
+			info!("task {name} exited cleanly");
+			Ok(())
+		}
+		Err(err) => {
+			warn!("task {name} failed: {err:?}");
+			Err(err)
+		}
+	}
+}
 
 async fn force_mode(dwc2: &Arc<Dwc2>, mode: Mode) -> Result<()> {
 	let dwc2 = Arc::clone(dwc2);
@@ -110,24 +125,42 @@ async fn main() -> Result<()> {
 		.await
 		.context("failed to run usb handshake")?;
 
-	let net_iface = get_ncm_device_name(&head_unit_usb)
-		.await
-		.context("failed to get ncm device name")?;
-	let link = configure_ncm(&net_iface)
-		.await
-		.context("failed to configure ncm device")?;
-	debug!(
-		"ncm link up: {} scope {} mac {}",
-		link.ip,
-		link.scope_id,
-		format_mac_lower(link.mac)
-	);
+	// run usb and net in parallel for time reasons
+	let (r1, r2) = join(
+		async {
+			let usb = CarplayUsbSession::new(&identity, &head_unit_usb)
+				.await
+				.context("failed to establish the iAP2 session")?;
+			set.spawn(wrap("usb task", usb.run()));
+			anyhow::Ok(())
+		},
+		async {
+			let net_iface = get_ncm_device_name(&head_unit_usb)
+				.await
+				.context("failed to get ncm device name")?;
+			let link = configure_ncm(&net_iface)
+				.await
+				.context("failed to configure ncm device")?;
 
-	mdns.enable_interface(&net_iface)
-		.context("failed to enable ncm device for mdns")?;
+			debug!(
+				"ncm link up: {} scope {} mac {}",
+				link.ip,
+				link.scope_id,
+				format_mac_lower(link.mac)
+			);
+
+			mdns.enable_interface(&net_iface)
+				.context("failed to enable ncm device for mdns")?;
+
+			anyhow::Ok(link)
+		},
+	).await;
+	r1?;
+	let link = r2?;
 
 	let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
-	set.spawn(
+	set.spawn(wrap(
+		"ctrl server",
 		CarplayCtrlServer {
 			conn_tx,
 			device_id,
@@ -137,33 +170,25 @@ async fn main() -> Result<()> {
 			port: 6767,
 		}
 		.run(),
-	);
-
-	let target_mac = timeout(Duration::from_millis(500), conn_rx.recv())
-		.await
-		.ok()
-		.flatten();
-	set.spawn(async move {
+	));
+	set.spawn(wrap("ctrl server watcher", async move {
 		while let Some(addr) = conn_rx.recv().await {
-			warn!("got carplay-ctrl connect addr late {addr:?}");
+			info!("got carplay-ctrl connect addr {addr:?}");
 		}
 		Ok(())
-	});
-	if target_mac.is_none() {
-		warn!("carplay-ctrl timed out");
-	}
+	}));
 
-	let head_unit_net = find_head_unit_server(mdns, target_mac, link.scope_id)
+	// TODO maybe just remove carplay-ctrl as an input since it's wireless only?
+	let head_unit_net = find_head_unit_server(mdns, None, link.scope_id)
 		.await
 		.context("failed to find head unit server")?;
 
-	let (carplay_session, usb, net) = CarplaySession::new(
+	let (carplay_session, net) = CarplaySession::new(
 		&mut set,
 		&mut identity,
 		&mut pairing,
 		device_id,
 		link,
-		head_unit_usb,
 		head_unit_net,
 	)
 	.await
@@ -171,9 +196,8 @@ async fn main() -> Result<()> {
 
 	info!("carplay session ready");
 
-	set.spawn(usb.run());
-	set.spawn(net.run());
-	set.spawn(carplay_session.run());
+	set.spawn(wrap("net task", net.run()));
+	set.spawn(wrap("carplay session task", carplay_session.run()));
 
 	while let Some(ret) = set.join_next().await {
 		ret.context("failed to join")?
