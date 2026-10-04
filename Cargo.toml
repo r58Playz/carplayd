@@ -10,6 +10,7 @@ log = { version = "0.4.29", features = ["std"] }
 nusb = { version = "0.2.3", features = ["tokio"] }
 tokio = { version = "1.51.0", features = ["full"] }
 libc = "0.2"
+v4l2r = "0.0.8"
 usb-gadget = { version = "1.1.1", features = ["tokio"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 futures = "0.3"

@@ -151,18 +151,15 @@ pub struct AccessoryInfo {
 	// --- capability flags ---
 	/// Supports the UDP session idle keepalive.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub keep_alive_low_power: Option<bool>,
 	/// Supports statistics in the keepalive body. Debug only.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub keep_alive_send_stats_as_body: Option<bool>,
 	/// See [`extended_feature`].
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub extended_features: Option<Vec<String>>,
 	/// Whether certain UI elements are currently limited.
 	#[serde(default, rename = "limitedUI", skip_serializing_if = "Option::is_none")]
-	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub limited_ui: Option<bool>,
 	/// Which elements limited UI affects. See [`limited_ui_element`].
 	#[serde(
@@ -174,11 +171,9 @@ pub struct AccessoryInfo {
 	/// Dark outside. An accessory that does not support night mode must return an
 	/// unsupported error rather than a value, so the device can fall back to time of day.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub night_mode: Option<bool>,
 	/// True for a right-hand-drive vehicle.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub right_hand_drive: Option<bool>,
 	/// Bluetooth module MACs, colon separated. Required if the accessory has Bluetooth, and
 	/// a precondition for us sending `disableBluetooth`.
@@ -192,7 +187,6 @@ pub struct AccessoryInfo {
 	// --- branding ---
 	/// Whether the OEM icon appears on the home screen.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub oem_icon_visible: Option<bool>,
 	/// Label under the OEM icon.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -353,7 +347,6 @@ pub struct OemIcon {
 	pub width_pixels: u32,
 	pub height_pixels: u32,
 	/// True for a full-bleed icon, false for a mask.
-	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::boolean")]
 	pub prerendered: bool,
 }
 
@@ -414,7 +407,6 @@ pub struct VehicleInformation {
 /// Tables 30-39 and 30-40, which have identical shapes.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct ActiveFlag {
-	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::boolean")]
 	pub active: bool,
 }
 
@@ -448,7 +440,6 @@ pub mod haptic_feedback_type {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::carplay::net::proto::to_binary;
 
 	/// Table 30-27 defines one key. The default request must therefore put nothing on the
 	/// wire — an empty dictionary, which the accessory reads as "return everything".

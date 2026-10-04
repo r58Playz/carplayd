@@ -17,6 +17,7 @@ use crate::{
 pub mod ctrl_server;
 pub mod net;
 pub mod usb;
+pub mod modes;
 
 pub type MacAddr = [u8; 6];
 

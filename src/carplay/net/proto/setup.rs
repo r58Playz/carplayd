@@ -124,7 +124,6 @@ pub struct SetupRequest {
 	pub features: Option<Vec<String>>,
 	/// Whether we support the UDP idle keepalive (§30.3.2.9).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub keep_alive_low_power: Option<bool>,
 }
 
@@ -209,11 +208,9 @@ pub struct StreamRequest {
 	pub audio_type: Option<String>,
 	/// Debug only: loop output back as input.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub audio_loopback: Option<bool>,
 	/// Enable audio input. Main audio only.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[serde(deserialize_with = "crate::carplay::net::proto::flexible::option_boolean")]
 	pub input: Option<bool>,
 	/// UDP port we listen on for RTCP. Main high audio only.
 	#[serde(default, skip_serializing_if = "Option::is_none")]

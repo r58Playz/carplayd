@@ -77,7 +77,8 @@ impl HeadUnitTcpConnection {
 			}
 			Either::Right(_) => {
 				warn!("attempted to upgrade already upgraded connection");
-				parts
+				self.channel = Some(Channel::from_parts(parts, cseq));
+				bail!("connection is already encrypted");
 			}
 		};
 

@@ -27,6 +27,10 @@
 //! **Optional means optional on the wire.** Fields the spec marks `N` are `Option<T>` with
 //! `skip_serializing_if`, so an absent value is an absent key rather than a null.
 //!
+//! **Scalar flexibility follows the destination type.** Numbers and booleans accept
+//! compatible strings through [`from_binary`] and [`from_value`]; ordinary strings and
+//! raw [`plist::Value`] payloads retain their original values.
+//!
 //! **Integers are signed.** plist has one integer type and iOS puts genuinely negative
 //! values in it — iOS 14.6 sends `streamConnectionID = -8950532481248312265`. Everything
 //! numeric is `i64`/`f64` for that reason; see [`setup::StreamRequest::connection_id`] for
@@ -38,6 +42,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 pub mod command;
 pub mod feedback;
+pub mod flexible;
 pub mod info;
 pub mod modes;
 pub mod setup;
@@ -52,156 +57,20 @@ pub fn to_binary<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 	Ok(out)
 }
 
-/// Coerce numeric and boolean strings in place, per §30.3: "The CarPlay communication
-/// protocol is flexible in its parsing of parameter values. CarPlay message parameters that
-/// are numbers, enum values, or booleans may be provided as strings that parse as those
-/// data types."
-///
-/// The Prius exercises this — its `/info` returns a latency as `"102000"` rather than
-/// `102000`, which serde rejects as `invalid type: string "102000", expected i64`.
-///
-/// Coercion is by shape, not by key, since the flexibility is a property of the protocol
-/// rather than of any particular field. Two shapes convert:
-///
-/// * A *canonical* decimal integer — no leading zeros, no plus sign, no surrounding space,
-///   and it must round-trip through `to_string`. The Prius sends `"102000"`.
-/// * A `0x`-prefixed hexadecimal integer, which is how this accessory writes bitfields. It
-///   sends `"0x54"` where a `u64` is expected, and its `_airplay._tcp` TXT record already
-///   showed the habit with `features=0x4040280,0x41` and `flags=0x4`.
-///
-/// That leaves every version and identifier string this protocol carries untouched —
-/// `"600.8.1"`, `"19C63"`, `"1.0.8"`, `"15CY MOP"`, MACs, UUIDs — because none of them are
-/// either shape.
-///
-/// A false positive is not silent: a genuine string field holding bare digits would arrive
-/// as an integer and serde would say so, rather than corrupting the value.
-fn coerce_flexible(value: &mut plist::Value) {
-	fn flexible_integer(s: &str) -> Option<plist::Integer> {
-		// A trailing `#` comment. The Prius answers `/info` with an audio format of
-		//
-		//     "0x4000    # 8800 previous value. Change to have 16 bit on IOS < 9"
-		//
-		// which is a configuration-file comment that shipped inside the value. `0x4000` is
-		// `PCM_48000_16_MONO` and the `8800` it mentions is `PCM_48000_16_STEREO |
-		// PCM_44100_16_STEREO`, so someone edited the bitfield and left their note behind.
-		// Only the whitespace before the comment is trimmed; a value with no `#` still has
-		// to be exactly canonical.
-		let s = match s.split_once('#') {
-			Some((head, comment)) => {
-				let head = head.trim_end();
-				debug!("dropping a trailing comment from the plist value {head:?}: #{comment}");
-				head
-			}
-			None => s,
-		};
-
-		// Signed first, so small values land in the arm most fields expect.
-		if let Ok(n) = s.parse::<i64>()
-			&& n.to_string() == s
-		{
-			return Some(n.into());
-		}
-		if let Ok(n) = s.parse::<u64>()
-			&& n.to_string() == s
-		{
-			return Some(n.into());
-		}
-
-		let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
-		if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-			return None;
-		}
-		let n = u64::from_str_radix(hex, 16).ok()?;
-		Some(i64::try_from(n).map_or_else(|_| n.into(), plist::Integer::from))
-	}
-
-	match value {
-		plist::Value::String(s) => match s.as_str() {
-			"true" => *value = plist::Value::Boolean(true),
-			"false" => *value = plist::Value::Boolean(false),
-			s => {
-				if let Some(n) = flexible_integer(s) {
-					*value = plist::Value::Integer(n);
-				}
-			}
-		},
-		plist::Value::Array(items) => items.iter_mut().for_each(coerce_flexible),
-		plist::Value::Dictionary(dict) => dict.values_mut().for_each(coerce_flexible),
-		_ => {}
-	}
-}
-
-/// Field-level readers for values whose *type* the accessory plays loose with, where
-/// [`coerce_flexible`] cannot help because the fix depends on what the field expects.
-///
-/// Booleans are the case that matters: the Prius sends `0` and `1` as integers, and §30.3
-/// permits it, but folding every `0` into `false` before serde sees it would destroy every
-/// genuine numeric field. So the coercion has to happen where the target type is known,
-/// which means an explicit `deserialize_with` per field. A `bool` field that forgets one
-/// still fails loudly rather than silently, which is the right way round.
-pub mod flexible {
-	use serde::{Deserialize, Deserializer, de::Error};
-
-	fn truthy<E: Error>(value: plist::Value) -> Result<bool, E> {
-		match value {
-			plist::Value::Boolean(b) => Ok(b),
-			plist::Value::Integer(i) => i
-				.as_unsigned()
-				.map(|n| n != 0)
-				.or_else(|| i.as_signed().map(|n| n != 0))
-				.ok_or_else(|| E::custom("integer out of range for a boolean")),
-			other => Err(E::custom(format!("expected a boolean, got {other:?}"))),
-		}
-	}
-
-	/// A boolean that may arrive as `0` or `1`.
-	pub fn boolean<'de, D: Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
-		truthy(plist::Value::deserialize(de)?)
-	}
-
-	/// An identifier that may arrive as a number.
-	///
-	/// The Prius numbers its HID devices `0`, `1`, `2`, where both the specification and
-	/// its own `displays` use UUID strings — and `hidDevices` even carries a real UUID in
-	/// `displayUUID` alongside the integer `uuid`. Rendering the number back to decimal
-	/// keeps the value usable as the map key that [`super::info::UserPreferences`] expects,
-	/// whichever form it arrived in. `coerce_flexible` cannot settle this either way: a
-	/// string `"0"` and an integer `0` are indistinguishable by the time serde runs.
-	pub fn string<'de, D: Deserializer<'de>>(de: D) -> Result<String, D::Error> {
-		match plist::Value::deserialize(de)? {
-			plist::Value::String(s) => Ok(s),
-			plist::Value::Integer(i) => i
-				.as_signed()
-				.map(|n| n.to_string())
-				.or_else(|| i.as_unsigned().map(|n| n.to_string()))
-				.ok_or_else(|| D::Error::custom("integer out of range for an identifier")),
-			other => Err(D::Error::custom(format!(
-				"expected a string, got {other:?}"
-			))),
-		}
-	}
-
-	/// The same, for an optional field. An explicit null stays `None`.
-	pub fn option_boolean<'de, D: Deserializer<'de>>(de: D) -> Result<Option<bool>, D::Error> {
-		Option::<plist::Value>::deserialize(de)?
-			.map(truthy)
-			.transpose()
-	}
-}
-
 /// Decode a message from a body. Accepts binary or XML, because `plist` sniffs the header
 /// and a head unit that answers in XML is easier to accept than to argue with.
 pub fn from_binary<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-	let mut value: plist::Value = plist::from_bytes(bytes).context("failed to decode a plist")?;
-	coerce_flexible(&mut value);
+	let value: plist::Value = plist::from_bytes(bytes).context("failed to decode a plist")?;
+	from_value(&value)
+}
 
-	plist::from_value(&value).map_err(|err| {
-		// A serde type error names the type it wanted and nothing about where it wanted it,
-		// which is not much help against a document this size from firmware that is clearly
-		// hand-maintained. Dump what we parsed — after coercion, so the log shows exactly
-		// what serde was handed — and the offending key is findable by eye.
+/// Decode a parsed plist with CarPlay scalar flexibility. Raw values and strings are
+/// preserved; numeric and boolean conversions follow the destination Rust type.
+pub fn from_value<T: DeserializeOwned>(value: &plist::Value) -> Result<T> {
+	flexible::from_value(value).map_err(|err| {
+		// Keep the original wire values available when a typed decode fails.
 		let mut xml = Vec::new();
-		match plist::to_writer_xml(&mut xml, &value) {
+		match plist::to_writer_xml(&mut xml, value) {
 			Ok(()) => debug!(
 				"plist that failed to decode:\n{}",
 				String::from_utf8_lossy(&xml)
@@ -320,36 +189,29 @@ mod tests {
 				bitfield: 0x54,
 				big: u64::MAX,
 				commented: 0x4000,
-				// The comment strip only decides whether a shape matches; when it does not,
-				// the original string is left exactly as it arrived.
 				hash_in_a_string: "not a number # honest".to_string(),
 				enabled: true,
 				disabled: false,
 				source_version: "600.8.1".to_string(),
 				os_build: "19C63".to_string(),
-				// Not canonical, so it stays a string rather than becoming 7.
+				// A string field keeps its original spelling.
 				padded: "007".to_string(),
 				model: "15CY MOP".to_string(),
 			}
 		);
 	}
 
-	/// The Prius sends booleans as `0` and `1`. Shape coercion cannot do this one — folding
-	/// every integer `0` into `false` would wreck every numeric field — so it happens per
-	/// field, where the expected type is known.
+	/// Integer booleans work without field annotations and leave numeric fields intact.
 	#[test]
 	fn booleans_may_arrive_as_integers() {
 		#[derive(Debug, ::serde::Deserialize, PartialEq)]
 		struct Flags {
-			#[serde(deserialize_with = "flexible::boolean")]
 			prerendered: bool,
-			#[serde(deserialize_with = "flexible::boolean")]
 			active: bool,
-			#[serde(deserialize_with = "flexible::boolean")]
 			already_a_bool: bool,
-			#[serde(default, deserialize_with = "flexible::option_boolean")]
+			#[serde(default)]
 			night_mode: Option<bool>,
-			#[serde(default, deserialize_with = "flexible::option_boolean")]
+			#[serde(default)]
 			absent: Option<bool>,
 			latency: i64,
 		}
@@ -372,7 +234,7 @@ mod tests {
 				night_mode: Some(false),
 				absent: None,
 				// The neighbouring integer is untouched, which is the whole reason this is
-				// per field rather than a shape rule.
+				// type-directed rather than a shape rule.
 				latency: 0,
 			}
 		);
@@ -494,7 +356,7 @@ mod wire {
 		// A key we have never seen, to prove it does not break the parse.
 		dict.insert("somethingNew".into(), Value::Boolean(true));
 
-		let response: SetupResponse = plist::from_value(&Value::Dictionary(dict)).unwrap();
+		let response: SetupResponse = from_value(&Value::Dictionary(dict)).unwrap();
 
 		assert_eq!(response.event_port, Some(59232));
 		assert_eq!(response.timing_port, Some(59029));
@@ -544,7 +406,7 @@ mod wire {
 			Value::Array(vec![Value::Dictionary(stream)]),
 		);
 
-		let response: SetupResponse = plist::from_value(&Value::Dictionary(dict)).unwrap();
+		let response: SetupResponse = from_value(&Value::Dictionary(dict)).unwrap();
 		let streams = response.streams.unwrap();
 
 		assert_eq!(streams[0].r#type, StreamType::Screen);
@@ -554,7 +416,7 @@ mod wire {
 	/// `modesChanged` nests under `params`, and the two ID keys are capitalised.
 	#[test]
 	fn modes_changed_nests_under_params() {
-		let value = DeviceCommand::ModesChanged(Modes::initial(None))
+		let value = DeviceCommand::ModesChanged(Modes::screen_to_controller())
 			.to_value()
 			.unwrap();
 

@@ -249,7 +249,7 @@ impl AccessoryCommand {
 			"updateVehicleInformation" => Self::UpdateVehicleInformation {
 				vehicle_information: dict
 					.get("vehicleInformation")
-					.map(plist::from_value)
+					.map(super::from_value)
 					.transpose()
 					.context("failed to parse vehicleInformation")?
 					.context("updateVehicleInformation without a vehicleInformation")?,
@@ -331,7 +331,7 @@ fn to_dictionary_value<T: Serialize>(value: &T) -> Result<Value> {
 }
 
 fn from_dictionary<T: DeserializeOwned>(dict: &Dictionary) -> Result<T> {
-	plist::from_value(&Value::Dictionary(dict.clone())).context("failed to parse a command payload")
+	super::from_value(&Value::Dictionary(dict.clone())).context("failed to parse a command payload")
 }
 
 /// Read a payload that may be nested under `params` or splatted into the body.
@@ -340,25 +340,163 @@ fn from_dictionary<T: DeserializeOwned>(dict: &Dictionary) -> Result<T> {
 /// commands where we have no capture to settle it, accept both.
 fn unwrap_params<T: DeserializeOwned>(dict: &Dictionary) -> Result<T> {
 	match dict.get("params") {
-		Some(params) => plist::from_value(params).context("failed to parse command params"),
+		Some(params) => super::from_value(params).context("failed to parse command params"),
 		None => from_dictionary(dict),
 	}
 }
 
 fn integer(dict: &Dictionary, key: &str) -> Option<i64> {
-	dict.get(key)?.as_signed_integer()
+	super::from_value(dict.get(key)?).ok()
 }
 
 fn string(dict: &Dictionary, key: &str) -> Option<String> {
 	Some(dict.get(key)?.as_string()?.to_owned())
 }
 
-/// Accessory commands carry booleans the same loose way `/info` does — `0` and `1` as
-/// integers — so accept either. See [`super::flexible`].
+/// Use the same scalar decoding for commands and typed plist payloads.
 fn boolean(dict: &Dictionary, key: &str) -> Option<bool> {
-	let value = dict.get(key)?;
-	value.as_boolean().or_else(|| {
-		let n = value.as_signed_integer()?;
-		Some(n != 0)
-	})
+	super::from_value(dict.get(key)?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::carplay::net::proto::modes::{
+		AppStateId, Constraint, ResourceId, SpeechMode, TransferPriority, TransferType,
+	};
+
+	fn dict<const N: usize>(fields: [(&str, Value); N]) -> Value {
+		Value::Dictionary(
+			fields
+				.into_iter()
+				.map(|(key, value)| (key.to_owned(), value))
+				.collect(),
+		)
+	}
+
+	fn text(value: &str) -> Value {
+		Value::String(value.into())
+	}
+
+	fn decode(value: &Value) -> Result<AccessoryCommand> {
+		AccessoryCommand::from_binary(&super::super::to_binary(value)?)
+	}
+
+	#[test]
+	fn scalar_strings_are_decoded_after_command_dispatch() {
+		let value = dict([("type", text("requestSiri")), ("siriAction", text("2"))]);
+		assert!(matches!(
+			decode(&value).unwrap(),
+			AccessoryCommand::RequestSiri {
+				action: SiriAction::ButtonDown
+			}
+		));
+		let value = dict([("type", text("setNightMode")), ("nightMode", text("1"))]);
+		assert!(matches!(
+			decode(&value).unwrap(),
+			AccessoryCommand::SetNightMode { night_mode: true }
+		));
+		let value = dict([("type", text("setLimitedUI")), ("limitedUI", text("false"))]);
+		assert!(matches!(
+			decode(&value).unwrap(),
+			AccessoryCommand::SetLimitedUi { limited_ui: false }
+		));
+	}
+
+	#[test]
+	fn flat_and_nested_mode_requests_use_the_same_flexible_decoding() {
+		let params = dict([
+			(
+				"resources",
+				Value::Array(vec![dict([
+					("resourceID", text("1")),
+					("transferType", text("1")),
+					("transferPriority", text("500")),
+					("takeConstraint", text("0x64")),
+					("borrowConstraint", text("100")),
+				])]),
+			),
+			(
+				"appStates",
+				Value::Array(vec![
+					dict([("appStateID", text("1")), ("speechMode", text("-1"))]),
+					dict([("appStateID", text("2")), ("state", text("0"))]),
+				]),
+			),
+			("reasonStr", text("1234")),
+		]);
+		let mut flat = params.as_dictionary().unwrap().clone();
+		flat.insert("type".into(), text("changeModes"));
+		let nested = dict([("type", text("changeModes")), ("params", params)]);
+		for value in [Value::Dictionary(flat), nested] {
+			let AccessoryCommand::ChangeModes(change) = decode(&value).unwrap() else {
+				panic!("expected changeModes");
+			};
+			assert_eq!(change.reason_str.as_deref(), Some("1234"));
+			let resource = &change.resources.unwrap()[0];
+			assert_eq!(resource.resource_id, ResourceId::MainScreen);
+			assert_eq!(resource.transfer_type, TransferType::Take);
+			assert_eq!(
+				resource.transfer_priority,
+				Some(TransferPriority::UserInitiated)
+			);
+			assert_eq!(resource.take_constraint, Some(Constraint::Anytime));
+			assert_eq!(resource.borrow_constraint, Some(Constraint::Anytime));
+			let states = change.app_states.unwrap();
+			assert_eq!(states[0].app_state_id, AppStateId::Speech);
+			assert_eq!(states[0].speech_mode, Some(SpeechMode::None));
+			assert_eq!(states[1].app_state_id, AppStateId::PhoneCall);
+			assert_eq!(states[1].state, Some(false));
+		}
+	}
+
+	#[test]
+	fn hid_reports_keep_identifier_spelling_and_binary_data() {
+		let value = dict([
+			("type", text("hidSendReport")),
+			("uuid", text("007")),
+			("hidReport", Value::Data(vec![1, 255, 0])),
+			("timestamp", text("1.25")),
+		]);
+		let AccessoryCommand::HidSendReport(report) = decode(&value).unwrap() else {
+			panic!("expected hidSendReport");
+		};
+		assert_eq!(report.uuid, "007");
+		assert_eq!(report.hid_report.as_ref(), &[1, 255, 0]);
+		assert_eq!(report.timestamp, Some(1.25));
+	}
+
+	#[test]
+	fn unknown_commands_preserve_raw_parameter_types() {
+		let value = dict([
+			("type", text("1234")),
+			("name", text("true")),
+			(
+				"params",
+				dict([
+					("number", text("0x54")),
+					("data", Value::Data(vec![0, 255])),
+				]),
+			),
+		]);
+		let AccessoryCommand::Unknown { r#type, body } = decode(&value).unwrap() else {
+			panic!("expected unknown command");
+		};
+		assert_eq!(r#type, "1234");
+		assert_eq!(body, value);
+	}
+
+	#[test]
+	fn invalid_scalar_parameters_are_rejected() {
+		let value = dict([
+			("type", text("requestSiri")),
+			("siriAction", text("invalid")),
+		]);
+		assert!(decode(&value).is_err());
+		let value = dict([
+			("type", text("setNightMode")),
+			("nightMode", text("invalid")),
+		]);
+		assert!(decode(&value).is_err());
+	}
 }
