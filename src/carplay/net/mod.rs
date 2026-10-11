@@ -1,29 +1,49 @@
 use std::{
-	future::poll_fn, net::SocketAddrV6, pin::Pin, task::{Context, Poll}, time::Duration,
+	future::poll_fn,
+	net::SocketAddrV6,
+	pin::{Pin, pin},
+	task::{Context, Poll},
+	time::Duration,
 };
 
 use anyhow::{Context as AnyhowContext, Result, anyhow, bail};
+use futures::future::{Either, select};
 use log::{debug, info, warn};
 use tokio::{
 	select,
-	sync::{mpsc, oneshot},
+	sync::{mpsc, oneshot, watch},
 };
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::{
 	carplay::{
-		CARPLAY_DEVICE_NAME, CARPLAY_MODEL, CARPLAY_OS_BUILD_VERSION, CARPLAY_SESSION_ID, CARPLAY_SOURCE_VERSION, DeviceIdentity, format_mac_lower, format_mac_upper, modes::{ModesConstraint, ModesEntity, ModesMachine, ModesOwnerState, ModesResourceId}, net::{
-			conn::HeadUnitTcpConnection, head_unit::HeadUnitServer, proto::{
-				command::{AccessoryCommand, ChangeModesResponse, DeviceCommand}, feedback::{FeedbackRequest, FeedbackResponse}, info::{AccessoryInfo, InfoRequest}, modes::Modes, setup::{
+		CARPLAY_DEVICE_NAME, CARPLAY_MODEL, CARPLAY_OS_BUILD_VERSION, CARPLAY_SESSION_ID,
+		CARPLAY_SOURCE_VERSION, DeviceIdentity, format_mac_lower, format_mac_upper,
+		modes::{ModesConstraint, ModesEntity, ModesMachine, ModesOwnerState, ModesResourceId},
+		net::{
+			conn::HeadUnitTcpConnection,
+			head_unit::HeadUnitServer,
+			proto::{
+				command::{AccessoryCommand, ChangeModesResponse, DeviceCommand},
+				feedback::{FeedbackRequest, FeedbackResponse},
+				info::{AccessoryInfo, InfoRequest},
+				modes::Modes,
+				setup::{
 					SetupRequest, SetupResponse, StreamRequest, StreamSetupRequest,
 					StreamSetupResponse, TeardownRequest, TimestampInfo,
 				},
-			}, rtsp::{Method, Request, Response}, screen::{EncoderCommand, ScreenStream}, timing::Clock,
+			},
+			rtsp::{Method, Request, Response},
+			screen::{EncoderCommand, ScreenStream},
+			timing::Clock,
 		},
-	}, pairing::{
+	},
+	pairing::{
 		identity::{PairIdentity, PairingStore, random_uuid},
 		keys::SessionKeys,
 	},
+	provider::CarplayProviderConnectionProxy,
+	v4l2::VideoParams,
 };
 
 pub mod codec;
@@ -107,12 +127,15 @@ pub struct CarplayNetSession {
 	rtsp_url: String,
 	clock: Clock,
 	info: AccessoryInfo,
+	video_params: VideoParams,
 
 	next_connection_id: i64,
 	modes: ModesMachine,
 
 	control: HeadUnitTcpConnection,
 	events: Option<HeadUnitTcpConnection>,
+
+	proxy: watch::Receiver<Option<CarplayProviderConnectionProxy>>,
 }
 impl CarplayNetSession {
 	pub async fn new(
@@ -120,6 +143,7 @@ impl CarplayNetSession {
 		pairing: &mut PairingStore,
 		head_unit: HeadUnitServer,
 		identity: DeviceIdentity,
+		proxy: watch::Receiver<Option<CarplayProviderConnectionProxy>>,
 		clock: Clock,
 		timing_port: u16,
 	) -> Result<Self> {
@@ -189,6 +213,15 @@ impl CarplayNetSession {
 			.await
 			.context("failed to GET /info")?;
 
+		let display = info.primary_display().context("no display")?;
+		let video_params = ScreenStream::probe(
+			display.width_pixels,
+			display.height_pixels,
+			display.max_fps.unwrap_or(30),
+		)
+		.await
+		.context("failed to probe screen encoder")?;
+
 		let events_addr = SocketAddrV6::new(
 			*head_unit.addr.ip(),
 			setup
@@ -210,14 +243,19 @@ impl CarplayNetSession {
 			rtsp_url,
 			clock,
 			info,
+			video_params,
 
-			// The receiver rejects a zero screen streamConnectionID before deriving keys.
 			next_connection_id: 1,
 			modes: ModesMachine::new(),
 
 			control,
 			events: Some(events),
+			proxy,
 		})
+	}
+
+	pub fn video_params(&self) -> VideoParams {
+		self.video_params
 	}
 
 	async fn command(&mut self, command: DeviceCommand) -> Result<()> {
@@ -257,51 +295,85 @@ impl CarplayNetSession {
 		) {
 			(ModesEntity::Controller, false) => {
 				// start screen
-				let screen = self.info.primary_display().context("no display")?;
-
-				let connection_id = self.next_connection_id;
-				self.next_connection_id += 1;
-
-				let req = StreamRequest {
-					uuid: Some(screen.uuid.clone()),
-					timestamp_info: Some(TimestampInfo::defaults()),
-					..StreamRequest::screen(connection_id, 75)
-				};
-				let keys = SessionKeys::data_stream(&self.shared_secret, req.connection_id());
-
-				let setup = self
-					.control
-					.req::<StreamSetupResponse>(
-						Method::Setup,
-						&self.rtsp_url,
-						&StreamSetupRequest { streams: vec![req] },
-					)
-					.await
-					.context("failed to send screen setup req")?
-					.streams
-					.context("no streams in response")?;
-				let stream = setup.first().context("no streams in response")?;
-
-				let addr = SocketAddrV6::new(
-					*self.server.addr.ip(),
-					stream.data_port.context("no data port in response")?,
-					self.server.addr.flowinfo(),
-					self.server.addr.scope_id(),
-				);
-
-				let screen = ScreenStream::new(
-					addr,
-					keys,
-					self.clock,
-					screen.width_pixels,
-					screen.height_pixels,
-					screen.max_fps.unwrap_or(30),
-				)
-				.await
-				.context("failed to create screen stream")?;
-
 				let (tx, rx) = mpsc::unbounded_channel();
-				streams.replace_screen(tx, screen.run(rx));
+
+				let provider = Box::pin({
+					let mut provider = self.proxy.clone();
+					async move {
+						let provider = provider
+							.wait_for(Option::is_some)
+							.await
+							.context("failed to wait for provider")?
+							.clone()
+							.unwrap();
+
+						provider.get_screen().await.context("failed to get screen")
+					}
+				});
+				let carplay = pin!(async {
+					let screen = self.info.primary_display().context("no display")?;
+
+					let connection_id = self.next_connection_id;
+					self.next_connection_id += 1;
+
+					let req = StreamRequest {
+						uuid: Some(screen.uuid.clone()),
+						timestamp_info: Some(TimestampInfo::defaults()),
+						..StreamRequest::screen(connection_id, 75)
+					};
+					let keys = SessionKeys::data_stream(&self.shared_secret, req.connection_id());
+
+					let setup = self
+						.control
+						.req::<StreamSetupResponse>(
+							Method::Setup,
+							&self.rtsp_url,
+							&StreamSetupRequest { streams: vec![req] },
+						)
+						.await
+						.context("failed to send screen setup req")?
+						.streams
+						.context("no streams in response")?;
+					let stream = setup.first().context("no streams in response")?;
+
+					let addr = SocketAddrV6::new(
+						*self.server.addr.ip(),
+						stream.data_port.context("no data port in response")?,
+						self.server.addr.flowinfo(),
+						self.server.addr.scope_id(),
+					);
+
+					let screen = ScreenStream::new(addr, keys, self.clock, self.video_params)
+						.await
+						.context("failed to create screen stream")?;
+
+					anyhow::Ok(screen)
+				});
+
+				let (screen, pending_provider) = match select(carplay, provider).await {
+					Either::Left((screen, provider)) => (screen?, Some(provider)),
+					Either::Right((provider, screen)) => {
+						tx.send(EncoderCommand::NewProvider(provider?))
+							.map_err(|_| anyhow!("failed to send new provider"))?;
+						(screen.await?, None)
+					}
+				};
+
+				streams.replace_screen(tx.clone(), async move {
+					let run = pin!(screen.run(rx));
+
+					match pending_provider {
+						None => run.await,
+						Some(provider) => match select(run, provider).await {
+							Either::Left((result, _)) => result,
+							Either::Right((provider, run)) => {
+								tx.send(EncoderCommand::NewProvider(provider?))
+									.map_err(|_| anyhow!("failed to send provider to encoder"))?;
+								run.await
+							}
+						},
+					}
+				});
 			}
 			(ModesEntity::Accessory, true) => {
 				// stop screen

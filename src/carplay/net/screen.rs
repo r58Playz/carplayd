@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, KeyInit};
-use log::{info, warn};
+use log::{trace, warn};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	net::{TcpSocket, TcpStream},
@@ -122,19 +122,22 @@ pub struct ScreenStream {
 	counter: u64,
 }
 impl ScreenStream {
+	pub async fn probe(width: u32, height: u32, fps: u32) -> Result<VideoParams> {
+		spawn_blocking(move || VideoEncoder::probe(Path::new(V4L2_DEVICE), width, height, fps))
+			.await
+			.context("failed to join encoder probe")?
+	}
+
 	pub async fn new(
 		addr: SocketAddrV6,
 		keys: SessionKeys,
 		clock: Clock,
-		width: u32,
-		height: u32,
-		fps: u32,
+		params: VideoParams,
 	) -> Result<Self> {
-		let encoder =
-			spawn_blocking(move || VideoEncoder::new(Path::new(V4L2_DEVICE), width, height, fps))
-				.await
-				.context("failed to join encoder")?
-				.context("failed to build encoder")?;
+		let encoder = spawn_blocking(move || VideoEncoder::new(Path::new(V4L2_DEVICE), params))
+			.await
+			.context("failed to join encoder")?
+			.context("failed to build encoder")?;
 
 		let socket = TcpSocket::new_v6().context("failed to create socket")?;
 		socket.set_nodelay(true).context("failed to set nodelay")?;
@@ -177,10 +180,7 @@ impl ScreenStream {
 		Ok(())
 	}
 
-	pub async fn run(
-		mut self,
-		encoder_ctrl: mpsc::UnboundedReceiver<EncoderCommand>,
-	) -> Result<()> {
+	pub async fn run(mut self, rx: mpsc::UnboundedReceiver<EncoderCommand>) -> Result<()> {
 		let stream = self.stream.take().unwrap();
 		let (mut read, mut write) = stream.into_split();
 		let params = video_config_params(self.encoder.params);
@@ -188,7 +188,7 @@ impl ScreenStream {
 		let force_key_frame = Arc::new(AtomicBool::new(false));
 		let mut provider = EncoderProvider {
 			force_key_frame: force_key_frame.clone(),
-			ctrl: encoder_ctrl,
+			ctrl: rx,
 			params: self.encoder.params,
 			current: EncoderProviderInternal::Waiting(WaitingProvider::new(self.encoder.params)),
 		};
@@ -273,7 +273,7 @@ impl ScreenStream {
 					.context("failed to write video frame")?;
 
 				if is_idr {
-					info!("sent keyframe");
+					trace!("sent keyframe");
 				}
 			}
 		};

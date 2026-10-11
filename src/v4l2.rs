@@ -14,7 +14,9 @@ use v4l2r::{
 	},
 	device::{
 		AllocatedQueue, Device, DeviceConfig, Stream, TryDequeue,
-		queue::{self, BuffersAllocated, GetFreeCaptureBuffer, GetFreeOutputBuffer, Queue},
+		queue::{
+			self, BuffersAllocated, GetFreeCaptureBuffer, GetFreeOutputBuffer, Queue, QueueInit,
+		},
 	},
 	ioctl::{CtrlWhich, DqBufIoctlError, IoctlConvertError, PlaneMapping},
 	memory::MmapHandle,
@@ -56,8 +58,17 @@ pub struct EncodedVideoFrame {
 }
 
 impl VideoParams {
+	fn ensure_matches(&self, expected: &Self) -> Result<()> {
+		if self != expected {
+			bail!(
+				"encoder video parameters changed since probe: expected {expected:?}, driver returned {self:?}"
+			);
+		}
+		Ok(())
+	}
+
 	/// Populated size of the single YU12 memory plane, including Y, U and V.
-	fn frame_size(&self) -> Result<usize> {
+	pub(crate) fn frame_size(&self) -> Result<usize> {
 		let y_size = self
 			.bytes_per_line
 			.checked_mul(self.buffer_height)
@@ -181,7 +192,7 @@ fn validate_output_frame_interval(parm: &bindings::v4l2_streamparm, fps: u32) ->
 	Ok(())
 }
 
-fn validate_mmap_buffers(
+pub(crate) fn validate_mmap_buffers(
 	device: &Device,
 	queue: QueueType,
 	count: usize,
@@ -329,6 +340,15 @@ async fn dequeue<Q: TryDequeue>(
 	}
 }
 
+struct NegotiatedEncoder {
+	device: Arc<Device>,
+	output_queue: Queue<queue::direction::Output, QueueInit>,
+	capture_queue: Queue<queue::direction::Capture, QueueInit>,
+	params: VideoParams,
+	output_size: usize,
+	capture_size: usize,
+}
+
 pub struct VideoEncoder {
 	pub params: VideoParams,
 	sps: Option<Bytes>,
@@ -441,7 +461,7 @@ impl VideoEncoder {
 
 		let output = dequeue(&self.device, &self.output, Interest::READABLE)
 			.await
-			.context("failed to wait for input buffer")?;
+			.context("failed to wait for output buffer")?;
 		let out_mapping = output
 			.get_plane_mapping(0)
 			.context("failed to get output buffer")?;
@@ -481,7 +501,7 @@ impl VideoEncoder {
 		Some(out.freeze())
 	}
 
-	pub fn new(device: &Path, width: u32, height: u32, fps: u32) -> Result<Self> {
+	fn negotiate(device: &Path, width: u32, height: u32, fps: u32) -> Result<NegotiatedEncoder> {
 		let (level, bitrate) =
 			level_for(width, height, fps).context("failed to decide encoding level/bitrate")?;
 
@@ -611,6 +631,31 @@ impl VideoEncoder {
 			bail!("H264 capture buffer size must be nonzero");
 		}
 
+		Ok(NegotiatedEncoder {
+			device,
+			output_queue,
+			capture_queue,
+			params,
+			output_size,
+			capture_size,
+		})
+	}
+
+	pub fn probe(device: &Path, width: u32, height: u32, fps: u32) -> Result<VideoParams> {
+		Ok(Self::negotiate(device, width, height, fps)?.params)
+	}
+
+	pub fn new(device: &Path, expected: VideoParams) -> Result<Self> {
+		let NegotiatedEncoder {
+			device,
+			output_queue,
+			capture_queue,
+			params,
+			output_size,
+			capture_size,
+		} = Self::negotiate(device, expected.width, expected.height, expected.fps)?;
+		params.ensure_matches(&expected)?;
+
 		let output_queue = output_queue
 			.request_buffers::<Vec<MmapHandle>>(6)
 			.context("failed to allocate output buffers")?;
@@ -689,6 +734,36 @@ mod tests {
 			assert_eq!(params.frame_size().unwrap(), expected);
 			assert!(params.validate(expected).is_ok());
 			assert!(params.validate(expected - 1).is_err());
+		}
+	}
+
+	#[test]
+	fn probe_comparison_rejects_changed_padding_with_the_same_visible_geometry() {
+		let probed = VideoParams {
+			width: 800,
+			height: 480,
+			fps: 30,
+			bytes_per_line: 832,
+			buffer_height: 496,
+		};
+		assert!(probed.ensure_matches(&probed).is_ok());
+
+		for actual in [
+			VideoParams {
+				bytes_per_line: 864,
+				..probed
+			},
+			VideoParams {
+				buffer_height: 512,
+				..probed
+			},
+		] {
+			// Both layouts are valid, but the provider has already prepared for the probe.
+			actual.validate(actual.frame_size().unwrap()).unwrap();
+			let error = actual.ensure_matches(&probed).unwrap_err().to_string();
+			assert!(error.contains("changed since probe"));
+			assert!(error.contains(&format!("expected {probed:?}")));
+			assert!(error.contains(&format!("driver returned {actual:?}")));
 		}
 	}
 

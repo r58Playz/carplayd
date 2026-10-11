@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
-use tokio::task::JoinSet;
+use tokio::{select, sync::watch, task::JoinSet};
 
 use crate::{
 	carplay::{
@@ -10,8 +10,9 @@ use crate::{
 			timing::{Clock, TimingServer},
 		},
 		usb::ncm::NcmLink,
-	},
-	pairing::identity::{PairIdentity, PairingStore},
+	}, pairing::identity::{PairIdentity, PairingStore}, provider::{
+		CarplayProvider, CarplayProviderConnection, CarplayProviderConnectionProxy, CarplayProviderConnectionServer, CarplayProviderScreen,
+	}, v4l2::VideoParams,
 };
 
 pub mod ctrl_server;
@@ -55,6 +56,8 @@ pub struct DeviceIdentity {
 pub struct CarplaySession {
 	clock: Clock,
 	device: DeviceIdentity,
+	video: VideoParams,
+	provider_tx: watch::Sender<Option<CarplayProviderConnectionProxy>>,
 }
 impl CarplaySession {
 	pub async fn new(
@@ -66,6 +69,8 @@ impl CarplaySession {
 		link: NcmLink,
 
 		head_unit_net: HeadUnitServer,
+		provider_rx: watch::Receiver<Option<CarplayProviderConnectionProxy>>,
+		provider_tx: watch::Sender<Option<CarplayProviderConnectionProxy>>,
 	) -> Result<(Self, CarplayNetSession)> {
 		let timing_port = 6768;
 		let clock = Clock::new();
@@ -86,17 +91,39 @@ impl CarplaySession {
 			pairing,
 			head_unit_net,
 			device,
+			provider_rx.clone(),
 			clock,
 			timing_port,
 		)
 		.await
 		.context("failed to establish the CarPlay session")?;
 
-		Ok((Self { clock, device }, net))
+		Ok((
+			Self {
+				clock,
+				device,
+				video: net.video_params(),
+				provider_tx,
+			},
+			net,
+		))
 	}
 
-	pub async fn run(self) -> Result<()> {
-		// TODO
-		Ok(())
+	pub async fn run<
+		P: CarplayProvider<Connection = C>,
+		C: CarplayProviderConnection<Screen = S>,
+		S: CarplayProviderScreen + 'static,
+	>(
+		self,
+		mut provider: P,
+	) -> Result<()> {
+		let conn = provider.wait_for_connection(self.video).await.context("failed to wait for connection")?;
+		let (server, proxy) = CarplayProviderConnectionServer::new(conn);
+		self.provider_tx.send(Some(proxy)).context("failed to publish provider")?;
+
+		select! {
+			_ = server.run() => bail!("server ended"),
+			x = provider.run() => x,
+		}
 	}
 }

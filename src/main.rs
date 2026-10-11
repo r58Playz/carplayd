@@ -5,9 +5,7 @@ use futures::future::join;
 use log::{LevelFilter, debug, info, warn};
 use mdns_sd::{IfKind, ServiceDaemon};
 use tokio::{
-	fs,
-	sync::mpsc,
-	task::{JoinSet, spawn_blocking},
+	fs, sync::{mpsc, watch}, task::{JoinSet, spawn_blocking},
 };
 
 use crate::{
@@ -22,9 +20,7 @@ use crate::{
 			head_unit::{HeadUnitUsb, find_iap2_device},
 			ncm::{configure_ncm, get_ncm_device_name},
 		},
-	},
-	gadget::{run_gadget, udc_name},
-	pairing::identity::{PairIdentity, PairingStore},
+	}, gadget::{run_gadget, udc_name}, pairing::identity::{PairIdentity, PairingStore}, provider::network::CarplayDebugNetworkProvider,
 };
 
 mod carplay;
@@ -127,6 +123,8 @@ async fn main() -> Result<()> {
 		.await
 		.context("failed to run usb handshake")?;
 
+	let (watch_tx, watch_rx) = watch::channel(None);
+
 	// run usb and net in parallel for time reasons
 	let (r1, r2) = join(
 		async {
@@ -185,6 +183,8 @@ async fn main() -> Result<()> {
 		.await
 		.context("failed to find head unit server")?;
 
+	let provider = CarplayDebugNetworkProvider::new(6767);
+
 	let (carplay_session, net) = CarplaySession::new(
 		&mut set,
 		&mut identity,
@@ -192,6 +192,8 @@ async fn main() -> Result<()> {
 		device_id,
 		link,
 		head_unit_net,
+		watch_rx,
+		watch_tx,
 	)
 	.await
 	.context("failed to handshake carplay session")?;
@@ -199,7 +201,7 @@ async fn main() -> Result<()> {
 	info!("carplay session ready");
 
 	set.spawn(wrap("net task", net.run()));
-	set.spawn(wrap("carplay session task", carplay_session.run()));
+	set.spawn(wrap("carplay session task", carplay_session.run(provider)));
 
 	while let Some(ret) = set.join_next().await {
 		ret.context("failed to join")?
