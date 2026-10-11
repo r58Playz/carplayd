@@ -15,9 +15,9 @@ use crate::{
 };
 
 pub mod ctrl_server;
+pub mod modes;
 pub mod net;
 pub mod usb;
-pub mod modes;
 
 pub type MacAddr = [u8; 6];
 
@@ -81,10 +81,16 @@ impl CarplaySession {
 				.run(),
 		);
 
-		let net =
-			CarplayNetSession::new(pair_identity, pairing, head_unit_net, device, timing_port)
-				.await
-				.context("failed to establish the CarPlay session")?;
+		let net = CarplayNetSession::new(
+			pair_identity,
+			pairing,
+			head_unit_net,
+			device,
+			clock,
+			timing_port,
+		)
+		.await
+		.context("failed to establish the CarPlay session")?;
 
 		Ok((Self { clock, device }, net))
 	}

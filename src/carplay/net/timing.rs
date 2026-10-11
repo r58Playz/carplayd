@@ -1,3 +1,4 @@
+//! vibecoded
 //! The wall clock, and the NTP server the accessory syncs to (§30.3.2.8.1).
 //!
 //! We are the device, so we are the *reference*: the accessory is the NTP client and we
@@ -22,10 +23,6 @@
 //! debug. The reference implementation does the same thing, offsetting monotonic uptime
 //! by the NTP epoch so the seconds field merely *looks* like a 1900-based timestamp; head
 //! units accept a wall clock that reads as 1 Jan 1970 without complaint.
-
-// Nothing calls this until SETUP exists to advertise `timingPort`; the module is
-// complete and tested on its own.
-#![allow(dead_code)]
 
 use std::{
 	io, mem,
@@ -87,6 +84,10 @@ impl Clock {
 	/// [`Clock::now`] in NTP fixed-point form, ready for the wire.
 	pub fn now_ntp(&self) -> u64 {
 		to_ntp64(self.now())
+	}
+
+	pub fn instant_ntp(&self, instant: Instant) -> u64 {
+		to_ntp64(NTP_EPOCH_OFFSET_NS + instant.saturating_duration_since(self.origin).as_nanos() as u64)
 	}
 
 	/// Move a kernel packet timestamp onto this clock.

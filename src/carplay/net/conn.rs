@@ -114,16 +114,17 @@ impl HeadUnitTcpConnection {
 		path: &str,
 		body: &impl Serialize,
 	) -> Result<Option<R>> {
+		let method_name = method.as_str().to_owned();
 		let res = self
 			.request(Request::new(method, path).body(
 				proto::CONTENT_TYPE,
 				proto::to_binary(body).context("failed to serialize body")?,
 			))
 			.await
-			.context("failed to send post")?;
+			.with_context(|| format!("failed to send {method_name} {path}"))?;
 
 		if !res.is_success() {
-			bail!("failed to POST {path}");
+			bail!("failed to {method_name} {path} {res:?}");
 		}
 
 		(!res.body.is_empty())

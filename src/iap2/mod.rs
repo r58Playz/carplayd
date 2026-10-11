@@ -36,11 +36,6 @@
 //! policy::drive(&mut session, &mut handshake).await
 //! ```
 
-// `carplayd` is a binary, so nothing outside it consumes this module's API and the
-// compiler cannot see the unit tests that do. Everything here is either used by the
-// binary, exercised by tests, or a documented part of the protocol surface.
-#![allow(dead_code)]
-
 pub mod error;
 pub mod link;
 pub mod msg;
@@ -53,6 +48,6 @@ pub mod transport;
 pub use error::Error;
 pub use link::{Link, Role};
 pub use packet::MAX_PACKET_LEN;
-pub use policy::{DefaultPolicy, DeviceProfile, Handshake};
+pub use policy::{DeviceProfile, Handshake};
 pub use session::ControlSession;
 pub use sync::LinkParams;

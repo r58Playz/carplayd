@@ -37,6 +37,12 @@ impl TryFrom<Entity> for Option<ModesEntity> {
 	}
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum ModesOwnerState {
+	Borrowed,
+	Taken,
+}
+
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub enum ModesConstraint {
 	Anytime = 0,
@@ -187,6 +193,14 @@ impl ModesResource {
 		self.borrows.last().map(|x| x.entity).unwrap_or(self.entity)
 	}
 
+	pub fn owner_state(&self) -> ModesOwnerState {
+		if self.borrows.is_empty() {
+			ModesOwnerState::Taken
+		} else {
+			ModesOwnerState::Borrowed
+		}
+	}
+
 	fn handle_change(
 		&mut self,
 		entity: ModesEntity,
@@ -238,7 +252,7 @@ impl ModesResource {
 				)?;
 			}
 			TransferType::Untake => {
-				if !self.untake(entity)? {
+				if !self.untake(entity, None)? {
 					warn!("{entity:?} sent an invalid untake request, ignoring");
 				}
 			}
@@ -315,7 +329,7 @@ impl ModesResource {
 		}
 	}
 
-	pub fn untake(&mut self, entity: ModesEntity) -> Result<bool> {
+	pub fn untake(&mut self, entity: ModesEntity, handback_entity: Option<ModesEntity>) -> Result<bool> {
 		if self.entity != entity {
 			if self.owner() == entity {
 				return Ok(false);
@@ -326,6 +340,9 @@ impl ModesResource {
 
 		self.take_constraint = ModesConstraint::Anytime;
 		self.borrow_constraint = ModesConstraint::Anytime;
+		if let Some(entity) = handback_entity {
+			self.entity = entity;
+		}
 
 		Ok(true)
 	}
@@ -349,13 +366,6 @@ impl ModesMachine {
 			phone_call: None,
 			turn_by_turn: None,
 		}
-	}
-
-	pub fn main_screen_owner(&self) -> ModesEntity {
-		self.main_screen.owner()
-	}
-	pub fn main_audio_owner(&self) -> ModesEntity {
-		self.main_audio.owner()
 	}
 
 	pub fn speech(&self) -> Option<ModesSpeechState> {
@@ -519,6 +529,14 @@ impl ModesMachine {
 		self.turn_by_turn = turn_by_turn;
 
 		Ok(self.current_modes())
+	}
+
+	pub fn inspect_resource<T>(&self, id: ModesResourceId, func: impl Fn(&ModesResource) -> T) -> T {
+		let resource = match id {
+			ModesResourceId::MainScreen => &self.main_screen,
+			ModesResourceId::MainAudio => &self.main_audio,
+		};
+		(func)(resource)
 	}
 
 	pub fn resource(
@@ -713,7 +731,10 @@ mod tests {
 			let snapshot = machine.handle_mode_changes(other, changes).unwrap();
 
 			assert_active_app_states(&machine, owner);
-			assert_eq!(machine.main_screen_owner(), other);
+			assert_eq!(
+				machine.inspect_resource(ModesResourceId::MainScreen, |resource| resource.owner()),
+				other
+			);
 			assert!(
 				snapshot
 					.app_states
@@ -769,7 +790,10 @@ mod tests {
 				.handle_mode_changes(ModesEntity::Controller, changes)
 				.is_err()
 		);
-		assert_eq!(machine.main_screen_owner(), ModesEntity::Accessory);
+		assert_eq!(
+			machine.inspect_resource(ModesResourceId::MainScreen, |resource| resource.owner()),
+			ModesEntity::Accessory
+		);
 		assert_eq!(machine.speech(), None);
 		assert_eq!(machine.phone_call(), Some(ModesEntity::Accessory));
 	}

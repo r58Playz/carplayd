@@ -55,3 +55,4 @@ if [[ $build_only == false ]]; then
     echo "Copying $binary to $destination"
     scp -o ConnectTimeout=10 -- "$binary" "$destination"
 fi
+sha1sum "$binary"

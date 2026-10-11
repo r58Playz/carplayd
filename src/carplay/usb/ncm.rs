@@ -39,10 +39,14 @@ pub async fn get_ncm_device_name(head_unit: &HeadUnitUsb) -> Result<String> {
 		.context("no filename in device sysfs")?
 		.to_string_lossy();
 
-	let iface_sysfs = dev_sysfs.join(format!(
-		"{dev_name}:{active_config}.{}",
-		head_unit.ncm_control_interface
-	));
+	let iface_sysfs = dev_sysfs
+		.parent()
+		.context("no parent in device sysfs")?
+		.join(dev_name.to_string())
+		.join(format!(
+			"{dev_name}:{active_config}.{}",
+			head_unit.ncm_control_interface
+		));
 
 	let ncm_device = read_dir(iface_sysfs.join("net"))
 		.await
