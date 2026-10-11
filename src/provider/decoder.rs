@@ -18,10 +18,10 @@ use tokio::{
 use v4l2r::{
 	Format, PlaneLayout, Rect, bindings,
 	device::{
-		AllocatedQueue, Device, DeviceConfig, Stream, TryDequeue,
+		AllocatedQueue, Device, Stream, TryDequeue,
 		queue::{
-			self, BuffersAllocated, GetCaptureBufferByIndex, GetFreeBufferError,
-			GetFreeOutputBuffer, Queue, QueueInit,
+			self, GetCaptureBufferByIndex, GetFreeBufferError, GetFreeOutputBuffer, Queue,
+			QueueInit,
 		},
 	},
 	ioctl::{self, DqBufIoctlError, IoctlConvertError},
@@ -31,11 +31,8 @@ use v4l2r::{
 
 use crate::{
 	provider::frame::{FrameCrop, Yuv420Frame, Yuv420Layout},
-	v4l2::validate_mmap_buffers,
+	v4l2::{CaptureQueue, OutputQueue, dequeue, open_device, validate_mmap_buffers},
 };
-
-type InputQueue = Queue<queue::direction::Output, BuffersAllocated<Vec<MmapHandle>>>;
-type CaptureQueue = Queue<queue::direction::Capture, BuffersAllocated<Vec<MmapHandle>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct VideoDecoderConfig {
@@ -119,20 +116,6 @@ struct DecoderState {
 	ended: AtomicBool,
 }
 
-async fn dequeue<Q: TryDequeue>(
-	fd: &AsyncFd<Arc<Device>>,
-	queue: &Q,
-	interest: Interest,
-) -> Result<Q::Dequeued> {
-	loop {
-		let mut guard = fd.ready(interest).await.context("failed to poll decoder")?;
-		match queue.try_dequeue() {
-			Err(IoctlConvertError::IoctlError(DqBufIoctlError::NotReady)) => guard.clear_ready(),
-			res => return res.context("failed to dequeue decoder buffer"),
-		}
-	}
-}
-
 fn validate_input_size(len: usize, capacity: usize) -> Result<()> {
 	ensure!(
 		len != 0,
@@ -149,7 +132,7 @@ fn validate_input_size(len: usize, capacity: usize) -> Result<()> {
 /// next_frame(): processing headers can require CAPTURE setup before inputs complete.
 pub struct VideoDecoderInput {
 	device: Arc<AsyncFd<Arc<Device>>>,
-	queue: InputQueue,
+	queue: OutputQueue,
 	state: Arc<DecoderState>,
 	max_access_unit_size: usize,
 	finishing: bool,
@@ -539,10 +522,7 @@ pub fn create_video_decoder(
 	config: VideoDecoderConfig,
 ) -> Result<(VideoDecoderInput, VideoDecoderOutput)> {
 	config.validate()?;
-	let device = Arc::new(
-		Device::open(device, DeviceConfig::new().non_blocking_dqbuf())
-			.context("failed to open decoder")?,
-	);
+	let device = open_device(device).context("failed to open decoder")?;
 	let mut output_queue =
 		Queue::get_output_mplane_queue(device.clone()).context("failed to get decoder OUTPUT")?;
 	let capture_queue =

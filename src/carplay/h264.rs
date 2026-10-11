@@ -1,5 +1,4 @@
-//! vibecoded
-//! H.264 bitstream surgery.
+//! CarPlay H.264 SPS/VUI rewriting.
 //!
 //! The encoder gives us a conformant stream that is nonetheless *not* what AIS R29 asks
 //! for, and no V4L2 control can fix it — `bcm2835-codec` exposes no VUI knob at all. So the
@@ -24,7 +23,7 @@
 use anyhow::{Context, Result, bail};
 
 /// Split an Annex-B bitstream into NAL units, dropping the start codes.
-pub fn split_annex_b(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+pub(super) fn split_annex_b(data: &[u8]) -> impl Iterator<Item = &[u8]> {
 	let mut starts = Vec::new();
 	let mut i = 0;
 	while i + 3 <= data.len() {
@@ -54,7 +53,7 @@ pub fn split_annex_b(data: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 /// Strip `emulation_prevention_three_byte`s: the `0x03` the encoder inserts after any
 /// `00 00` that would otherwise look like a start code (§7.4.1.1).
-pub fn unescape(ebsp: &[u8]) -> Vec<u8> {
+fn unescape(ebsp: &[u8]) -> Vec<u8> {
 	let mut out = Vec::with_capacity(ebsp.len());
 	let mut zeros = 0;
 
@@ -71,7 +70,7 @@ pub fn unescape(ebsp: &[u8]) -> Vec<u8> {
 }
 
 /// The inverse of [`unescape`].
-pub fn escape(rbsp: &[u8]) -> Vec<u8> {
+fn escape(rbsp: &[u8]) -> Vec<u8> {
 	let mut out = Vec::with_capacity(rbsp.len() + 4);
 	let mut zeros = 0;
 
@@ -87,22 +86,22 @@ pub fn escape(rbsp: &[u8]) -> Vec<u8> {
 	out
 }
 
-pub struct BitReader<'a> {
+struct BitReader<'a> {
 	data: &'a [u8],
 	bit: usize,
 }
 
 impl<'a> BitReader<'a> {
-	pub fn new(data: &'a [u8]) -> Self {
+	fn new(data: &'a [u8]) -> Self {
 		Self { data, bit: 0 }
 	}
 
 	/// Bits consumed so far — the anchor for copying a prefix through verbatim.
-	pub fn position(&self) -> usize {
+	fn position(&self) -> usize {
 		self.bit
 	}
 
-	pub fn read_bit(&mut self) -> Result<u32> {
+	fn read_bit(&mut self) -> Result<u32> {
 		let byte = self.bit / 8;
 		if byte >= self.data.len() {
 			bail!("ran off the end of the bitstream");
@@ -112,7 +111,7 @@ impl<'a> BitReader<'a> {
 		Ok(value as u32)
 	}
 
-	pub fn read_bits(&mut self, count: u32) -> Result<u32> {
+	fn read_bits(&mut self, count: u32) -> Result<u32> {
 		let mut value = 0;
 		for _ in 0..count {
 			value = (value << 1) | self.read_bit()?;
@@ -120,12 +119,12 @@ impl<'a> BitReader<'a> {
 		Ok(value)
 	}
 
-	pub fn read_flag(&mut self) -> Result<bool> {
+	fn read_flag(&mut self) -> Result<bool> {
 		Ok(self.read_bit()? == 1)
 	}
 
 	/// Unsigned exp-Golomb, `ue(v)` (§9.1).
-	pub fn read_ue(&mut self) -> Result<u32> {
+	fn read_ue(&mut self) -> Result<u32> {
 		let mut leading = 0;
 		while self.read_bit()? == 0 {
 			leading += 1;
@@ -144,7 +143,7 @@ impl<'a> BitReader<'a> {
 	}
 
 	/// Signed exp-Golomb, `se(v)` (§9.1.1).
-	pub fn read_se(&mut self) -> Result<i32> {
+	fn read_se(&mut self) -> Result<i32> {
 		let k = self.read_ue()?;
 		Ok(if k % 2 == 1 {
 			((k + 1) / 2) as i32
@@ -155,18 +154,18 @@ impl<'a> BitReader<'a> {
 }
 
 #[derive(Default)]
-pub struct BitWriter {
+struct BitWriter {
 	data: Vec<u8>,
 	/// Bits already written into the byte under construction.
 	used: u32,
 }
 
 impl BitWriter {
-	pub fn new() -> Self {
+	fn new() -> Self {
 		Self::default()
 	}
 
-	pub fn write_bit(&mut self, value: u32) {
+	fn write_bit(&mut self, value: u32) {
 		if self.used == 0 {
 			self.data.push(0);
 		}
@@ -177,17 +176,17 @@ impl BitWriter {
 		self.used = (self.used + 1) % 8;
 	}
 
-	pub fn write_bits(&mut self, value: u32, count: u32) {
+	fn write_bits(&mut self, value: u32, count: u32) {
 		for i in (0..count).rev() {
 			self.write_bit((value >> i) & 1);
 		}
 	}
 
-	pub fn write_flag(&mut self, value: bool) {
+	fn write_flag(&mut self, value: bool) {
 		self.write_bit(value as u32);
 	}
 
-	pub fn write_ue(&mut self, value: u32) {
+	fn write_ue(&mut self, value: u32) {
 		let coded = value as u64 + 1;
 		let bits = 64 - coded.leading_zeros();
 		for _ in 0..bits - 1 {
@@ -199,7 +198,7 @@ impl BitWriter {
 	}
 
 	/// Copy `count` bits straight across, so untouched syntax survives byte for byte.
-	pub fn copy_bits(&mut self, reader: &mut BitReader, count: usize) -> Result<()> {
+	fn copy_bits(&mut self, reader: &mut BitReader, count: usize) -> Result<()> {
 		for _ in 0..count {
 			let bit = reader.read_bit()?;
 			self.write_bit(bit);
@@ -208,34 +207,25 @@ impl BitWriter {
 	}
 
 	/// `rbsp_trailing_bits()` (§7.3.2.11): a one, then zeros to the byte boundary.
-	pub fn trailing_bits(&mut self) {
+	fn trailing_bits(&mut self) {
 		self.write_bit(1);
 		while self.used != 0 {
 			self.write_bit(0);
 		}
 	}
 
-	pub fn finish(self) -> Vec<u8> {
+	fn finish(self) -> Vec<u8> {
 		self.data
 	}
 }
 
 /// What we need from the SPS to rebuild its tail.
 struct SpsInfo {
-	profile_idc: u8,
-	constraint_flags: u8,
 	level_idc: u8,
-	bit_depth_luma: u32,
-	bit_depth_chroma: u32,
 	max_num_ref_frames: u32,
 	width_mbs: u32,
 	/// `FrameHeightInMbs`, which is doubled for field-coded streams.
 	height_mbs: u32,
-	/// `chroma_format_idc`, defaulting to 1 (4:2:0) on the profiles that do not carry it.
-	chroma_format_idc: u32,
-	frame_mbs_only: bool,
-	/// `frame_crop_{left,right,top,bottom}_offset`, in crop units rather than pixels.
-	crop: (u32, u32, u32, u32),
 	/// Bit offset of `vui_parameters_present_flag` inside the RBSP.
 	vui_present_bit: usize,
 	vui_present: bool,
@@ -248,20 +238,17 @@ fn parse_sps(rbsp: &[u8]) -> Result<SpsInfo> {
 	let mut r = BitReader::new(rbsp);
 
 	let profile_idc = r.read_bits(8)? as u8;
-	let constraint_flags = r.read_bits(8)? as u8;
+	r.read_bits(8)?; // constraint flags and reserved bits
 	let level_idc = r.read_bits(8)? as u8;
 	r.read_ue()?; // seq_parameter_set_id
 
-	let mut chroma_format_idc = 1;
-	let mut bit_depth_luma = 8;
-	let mut bit_depth_chroma = 8;
 	if HIGH_PROFILES.contains(&profile_idc) {
-		chroma_format_idc = r.read_ue()?;
+		let chroma_format_idc = r.read_ue()?;
 		if chroma_format_idc == 3 {
 			r.read_flag()?; // separate_colour_plane_flag
 		}
-		bit_depth_luma = r.read_ue()? + 8;
-		bit_depth_chroma = r.read_ue()? + 8;
+		r.read_ue()?; // bit_depth_luma_minus8
+		r.read_ue()?; // bit_depth_chroma_minus8
 		r.read_flag()?; // qpprime_y_zero_transform_bypass_flag
 
 		if r.read_flag()? {
@@ -302,26 +289,19 @@ fn parse_sps(rbsp: &[u8]) -> Result<SpsInfo> {
 	}
 	r.read_flag()?; // direct_8x8_inference_flag
 
-	// frame_cropping_flag. Retained but not rewritten. Rewriting these offsets is how a
-	// stream gets cropped without re-encoding, which is the tool to reach for if a head
-	// unit ever wants a geometry Android Auto will not produce; reading them is how we
-	// check that a frame whose dimensions are not a multiple of 16 is being cropped back
-	// to the size we told the accessory to expect.
-	let crop = if r.read_flag()? {
-		(r.read_ue()?, r.read_ue()?, r.read_ue()?, r.read_ue()?)
-	} else {
-		(0, 0, 0, 0)
-	};
+	// Skip cropping syntax; the entire prefix is copied unchanged when patching.
+	if r.read_flag()? {
+		r.read_ue()?; // frame_crop_left_offset
+		r.read_ue()?; // frame_crop_right_offset
+		r.read_ue()?; // frame_crop_top_offset
+		r.read_ue()?; // frame_crop_bottom_offset
+	}
 
 	let vui_present_bit = r.position();
 	let vui_present = r.read_flag()?;
 
 	Ok(SpsInfo {
-		profile_idc,
-		constraint_flags,
 		level_idc,
-		bit_depth_luma,
-		bit_depth_chroma,
 		max_num_ref_frames,
 		width_mbs,
 		height_mbs: if frame_mbs_only {
@@ -329,72 +309,8 @@ fn parse_sps(rbsp: &[u8]) -> Result<SpsInfo> {
 		} else {
 			2 * height_map_units
 		},
-		chroma_format_idc,
-		frame_mbs_only,
-		crop,
 		vui_present_bit,
 		vui_present,
-	})
-}
-
-/// Decoder-relevant SPS fields used by the offline compatibility validator.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpsInspection {
-	pub profile_idc: u8,
-	pub constraint_flags: u8,
-	pub level_idc: u8,
-	pub width: u32,
-	pub height: u32,
-	pub chroma_format_idc: u32,
-	pub bit_depth_luma: u32,
-	pub bit_depth_chroma: u32,
-	pub progressive: bool,
-	pub max_num_ref_frames: u32,
-	pub full_range: Option<bool>,
-	pub colour_description: Option<(u32, u32, u32)>,
-	pub timing: Option<(u32, u32, bool)>,
-	pub bitstream_restriction: Option<(u32, u32)>,
-}
-
-pub fn inspect_sps(nal: &[u8]) -> Result<SpsInspection> {
-	let rbsp = unescape(nal.get(1..).context("SPS NAL is empty")?);
-	let info = parse_sps(&rbsp).context("failed to parse the SPS")?;
-	let (width, height) = display_size(nal)?;
-	let vui = if info.vui_present {
-		let mut reader = BitReader::new(&rbsp);
-		for _ in 0..=info.vui_present_bit {
-			reader.read_bit()?;
-		}
-		Some(Vui::read(&mut reader).context("failed to parse SPS VUI")?)
-	} else {
-		None
-	};
-	let full_range = vui
-		.as_ref()
-		.and_then(|v| v.video_signal.map(|signal| signal.1));
-	let colour_description = vui
-		.as_ref()
-		.and_then(|v| v.video_signal.and_then(|signal| signal.2));
-	let timing = vui.as_ref().and_then(|v| v.timing);
-	let bitstream_restriction = vui.as_ref().and_then(|v| {
-		v.bitstream_restriction
-			.map(|restriction| (restriction.5, restriction.6))
-	});
-	Ok(SpsInspection {
-		profile_idc: info.profile_idc,
-		constraint_flags: info.constraint_flags,
-		level_idc: info.level_idc,
-		width,
-		height,
-		chroma_format_idc: info.chroma_format_idc,
-		bit_depth_luma: info.bit_depth_luma,
-		bit_depth_chroma: info.bit_depth_chroma,
-		progressive: info.frame_mbs_only,
-		max_num_ref_frames: info.max_num_ref_frames,
-		full_range,
-		colour_description,
-		timing,
-		bitstream_restriction,
 	})
 }
 
@@ -635,7 +551,7 @@ impl Vui {
 
 /// What §30.2.8.1 wants stated in the VUI.
 #[derive(Clone, Copy, Debug)]
-pub struct VuiSettings {
+pub(super) struct VuiSettings {
 	/// `video_full_range_flag`.
 	///
 	/// The spec says CarPlay content is always full range, so this defaults to `true`.
@@ -644,7 +560,7 @@ pub struct VuiSettings {
 	/// whites. Whether a real head unit honours the flag or assumes full range regardless
 	/// is untested — if it honours it, clear this for AA content; if it does not, the
 	/// pixels need converting instead.
-	pub full_range: bool,
+	pub(super) full_range: bool,
 }
 
 impl Default for VuiSettings {
@@ -684,7 +600,7 @@ fn max_dpb_mbs(level_idc: u8) -> Option<u32> {
 }
 
 /// `MaxDpbFrames` = `Min(MaxDpbMbs / (PicWidthInMbs * FrameHeightInMbs), 16)`, per §A.3.1.
-pub fn max_dpb_frames(level_idc: u8, width_mbs: u32, height_mbs: u32) -> Option<u32> {
+fn max_dpb_frames(level_idc: u8, width_mbs: u32, height_mbs: u32) -> Option<u32> {
 	let macroblocks = width_mbs.checked_mul(height_mbs)?;
 	if macroblocks == 0 {
 		return None;
@@ -695,49 +611,9 @@ pub fn max_dpb_frames(level_idc: u8, width_mbs: u32, height_mbs: u32) -> Option<
 /// Rewrite an SPS NAL so its VUI says what §30.2.8.1 requires.
 ///
 /// Everything ahead of `vui_parameters_present_flag` is copied bit for bit; only the VUI
-/// is rebuilt. An existing VUI is parsed and preserved except for the two fields being
-/// overridden, so aspect ratio, timing and HRD survive.
-/// The dimensions an SPS actually *displays*, after its cropping rectangle.
-///
-/// An encoder handed a size that is not a whole number of 16x16 macroblocks codes up to the
-/// next one and signals the difference here — 1080x678 is coded as 68x43 macroblocks, or
-/// 1088x688, and cropped back. §30.2.8 requires the accessory be sent its reported target
-/// resolution "pixel for pixel without resorting to scaling or stretching", so if the crop
-/// is missing the accessory receives a picture 8 pixels wider and 10 taller than the one it
-/// was told to expect in `SETUP`.
-///
-/// Crop offsets are in crop units, not pixels (§7.4.2.1.1): `CropUnitX` is `SubWidthC` and
-/// `CropUnitY` is `SubHeightC * (2 - frame_mbs_only_flag)`, which for 4:2:0 progressive is
-/// 2 and 2.
-pub fn display_size(nal: &[u8]) -> Result<(u32, u32)> {
-	let rbsp = unescape(nal.get(1..).context("SPS NAL is empty")?);
-	let info = parse_sps(&rbsp).context("failed to parse the SPS")?;
-
-	let (sub_width, sub_height) = match info.chroma_format_idc {
-		0 => (1, 1), // monochrome
-		1 => (2, 2), // 4:2:0
-		2 => (2, 1), // 4:2:2
-		_ => (1, 1), // 4:4:4
-	};
-	let crop_unit_x = if info.chroma_format_idc == 0 {
-		1
-	} else {
-		sub_width
-	};
-	let crop_unit_y = if info.chroma_format_idc == 0 {
-		1
-	} else {
-		sub_height
-	} * (2 - u32::from(info.frame_mbs_only));
-
-	let (left, right, top, bottom) = info.crop;
-	let width = (info.width_mbs * 16).saturating_sub(crop_unit_x * (left + right));
-	let height = (info.height_mbs * 16).saturating_sub(crop_unit_y * (top + bottom));
-
-	Ok((width, height))
-}
-
-pub fn patch_sps(nal: &[u8], settings: &VuiSettings) -> Result<Vec<u8>> {
+/// is rebuilt. Aspect ratio and other display metadata survive, while timing and HRD
+/// are removed to keep the CarPlay configuration record compact.
+pub(super) fn patch_sps(nal: &[u8], settings: &VuiSettings) -> Result<Vec<u8>> {
 	let (&header, payload) = nal.split_first().context("empty SPS NAL")?;
 	if header & 0x1F != 7 {
 		bail!("not an SPS NAL: header byte {header:#04x}");
@@ -822,6 +698,14 @@ pub fn patch_sps(nal: &[u8], settings: &VuiSettings) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	// Captured from a live Toyota/Kenwood 15CY session at 1080x678, with cropping,
+	// timing information and NAL HRD.
+	const DRIVER_SPS: &[u8] = &[
+		0x27, 0x64, 0x00, 0x1F, 0xAC, 0x2B, 0x40, 0x22, 0x02, 0xBF, 0x2C, 0xD3, 0x64, 0x00, 0x00,
+		0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xF3, 0x82, 0x00, 0x00, 0x86, 0x47, 0x00, 0x01,
+		0xAB, 0x3F, 0xBD, 0xEE, 0x01, 0xE2, 0x44, 0xCF,
+	];
 
 	/// A real 800x480 High 3.1 SPS with no VUI, as `bcm2835-codec` emits it.
 	fn sample_sps() -> Vec<u8> {
@@ -961,36 +845,31 @@ mod tests {
 
 	#[test]
 	fn patching_preserves_everything_ahead_of_the_vui() {
-		let original = sample_sps();
-		let patched = patch_sps(&original, &VuiSettings::default()).unwrap();
+		for original in [sample_sps(), DRIVER_SPS.to_vec()] {
+			let patched = patch_sps(&original, &VuiSettings::default()).unwrap();
+			let original_rbsp = unescape(&original[1..]);
+			let patched_rbsp = unescape(&patched[1..]);
+			let before = parse_sps(&original_rbsp).unwrap();
+			let after = parse_sps(&patched_rbsp).unwrap();
 
-		let before = parse_sps(&unescape(&original[1..])).unwrap();
-		let after = parse_sps(&unescape(&patched[1..])).unwrap();
+			assert_eq!(patched[0], original[0], "NAL header byte");
+			assert_eq!(after.level_idc, before.level_idc);
+			assert_eq!(after.width_mbs, before.width_mbs);
+			assert_eq!(after.height_mbs, before.height_mbs);
+			assert_eq!(after.max_num_ref_frames, before.max_num_ref_frames);
+			assert_eq!(after.vui_present_bit, before.vui_present_bit);
 
-		assert_eq!(patched[0], original[0], "NAL header byte");
-		assert_eq!(after.level_idc, before.level_idc);
-		assert_eq!(after.width_mbs, before.width_mbs);
-		assert_eq!(after.height_mbs, before.height_mbs);
-		assert_eq!(after.max_num_ref_frames, before.max_num_ref_frames);
-		assert_eq!(
-			after.vui_present_bit, before.vui_present_bit,
-			"the prefix must be bit-identical, so the flag lands in the same place"
-		);
-	}
-
-	/// A frame that is not a whole number of macroblocks must come back out at the size the
-	/// accessory was promised. 1080x678 codes as 68x43 macroblocks — 1088x688 — so the SPS
-	/// has to crop 8 columns and 10 rows, which in 4:2:0 progressive crop units is 4 and 5.
-	#[test]
-	fn display_size_applies_the_cropping_rectangle() {
-		let uncropped = sample_sps();
-		let (width, height) = display_size(&uncropped).unwrap();
-		assert_eq!(width % 16, 0, "the sample is macroblock aligned");
-		assert_eq!(height % 16, 0);
-
-		// A patched SPS keeps whatever cropping it arrived with.
-		let patched = patch_sps(&uncropped, &VuiSettings::default()).unwrap();
-		assert_eq!(display_size(&patched).unwrap(), (width, height));
+			// Compare the entire prefix, including cropping and syntax we only skip.
+			let mut original_bits = BitReader::new(&original_rbsp);
+			let mut patched_bits = BitReader::new(&patched_rbsp);
+			for bit in 0..before.vui_present_bit {
+				assert_eq!(
+					original_bits.read_bit().unwrap(),
+					patched_bits.read_bit().unwrap(),
+					"SPS prefix bit {bit} changed"
+				);
+			}
+		}
 	}
 
 	#[test]
@@ -1010,15 +889,9 @@ mod tests {
 	/// be 45% over the reference and hope.
 	#[test]
 	fn the_configuration_record_stays_near_the_reference_size() {
-		// Captured from a live session against a Toyota/Kenwood 15CY at 1080x678.
-		let driver_sps = [
-			0x27u8, 0x64, 0x00, 0x1F, 0xAC, 0x2B, 0x40, 0x22, 0x02, 0xBF, 0x2C, 0xD3, 0x64, 0x00,
-			0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xF3, 0x82, 0x00, 0x00, 0x86, 0x47,
-			0x00, 0x01, 0xAB, 0x3F, 0xBD, 0xEE, 0x01, 0xE2, 0x44, 0xCF,
-		];
 		let pps_len = 5;
 
-		let patched = patch_sps(&driver_sps, &VuiSettings::default()).unwrap();
+		let patched = patch_sps(DRIVER_SPS, &VuiSettings::default()).unwrap();
 
 		// 11 bytes of record header and counts, the two parameter sets, and the four
 		// trailing bytes every capture carries.

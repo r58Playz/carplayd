@@ -16,6 +16,8 @@ use crate::{
 };
 
 pub mod ctrl_server;
+pub mod encoder;
+mod h264;
 pub mod modes;
 pub mod net;
 pub mod usb;

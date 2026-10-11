@@ -29,7 +29,6 @@ mod iap2;
 mod pairing;
 mod provider;
 mod v4l2;
-mod h264;
 
 const HEAD_UNIT_ATTEMPTS: u32 = 100;
 const HEAD_UNIT_INTERVAL: Duration = Duration::from_millis(10);

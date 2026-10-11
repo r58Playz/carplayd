@@ -24,10 +24,13 @@ use tokio::{
 use v4l2r::ioctl::PlaneMapping;
 
 use crate::{
-	carplay::net::timing::Clock,
+	carplay::{
+		encoder::{EncodedVideoFrame, HEADER_LEN, TAG_LEN, VideoEncoder},
+		net::timing::Clock,
+	},
 	pairing::keys::{SessionKeys, stream_nonce},
 	provider::{CarplayProviderScreen, waiting::WaitingProvider},
-	v4l2::{EncodedVideoFrame, HEADER_LEN, TAG_LEN, VideoEncoder, VideoParams},
+	v4l2::VideoParams,
 };
 
 const V4L2_DEVICE: &str = "/dev/video11";
