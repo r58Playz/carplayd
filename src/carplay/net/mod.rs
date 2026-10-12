@@ -1,9 +1,10 @@
 use std::{
+	collections::HashMap,
 	future::poll_fn,
 	net::SocketAddrV6,
 	pin::{Pin, pin},
 	task::{Context, Poll},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use anyhow::{Context as AnyhowContext, Result, anyhow, bail};
@@ -19,6 +20,7 @@ use crate::{
 	carplay::{
 		CARPLAY_DEVICE_NAME, CARPLAY_MODEL, CARPLAY_OS_BUILD_VERSION, CARPLAY_SESSION_ID,
 		CARPLAY_SOURCE_VERSION, DeviceIdentity, format_mac_lower, format_mac_upper,
+		input::{HidParser, InputDevice},
 		modes::{ModesConstraint, ModesEntity, ModesMachine, ModesOwnerState, ModesResourceId},
 		net::{
 			conn::HeadUnitTcpConnection,
@@ -131,12 +133,34 @@ pub struct CarplayNetSession {
 
 	next_connection_id: i64,
 	modes: ModesMachine,
+	hid: HashMap<String, (InputDevice, HidParser)>,
 
 	control: HeadUnitTcpConnection,
 	events: Option<HeadUnitTcpConnection>,
 
 	proxy: watch::Receiver<Option<CarplayProviderConnectionProxy>>,
 }
+
+fn associated_display(uuid: String) -> Option<String> {
+	(!uuid.is_empty() && uuid != "00000000-0000-0000-0000-000000000000").then_some(uuid)
+}
+
+#[cfg(test)]
+mod input_tests {
+	use super::associated_display;
+
+	#[test]
+	fn hid_entry_display_association_handles_the_null_uuid() {
+		assert_eq!(
+			associated_display("00000000-0000-0000-0000-000000000000".into()),
+			None
+		);
+		assert_eq!(associated_display(String::new()), None);
+		let display = "9F01A153-B21C-4CF3-90CE-4D418E559F1B";
+		assert_eq!(associated_display(display.into()), Some(display.into()));
+	}
+}
+
 impl CarplayNetSession {
 	pub async fn new(
 		pair_identity: &mut PairIdentity,
@@ -221,6 +245,32 @@ impl CarplayNetSession {
 		)
 		.await
 		.context("failed to probe screen encoder")?;
+		let hid = info
+			.hid_devices
+			.clone()
+			.unwrap_or_default()
+			.into_iter()
+			.map(|x| (x.uuid, x.display_uuid, x.hid_descriptor))
+			.map(|(uuid, display_uuid, descriptor)| {
+				let hid = HidParser::new(descriptor.as_ref())
+					.context("failed to parse hid descriptor")?;
+
+				Ok((
+					uuid.clone(),
+					(
+						InputDevice::Network {
+							id: uuid,
+							associated_display: associated_display(display_uuid),
+							keys: hid.supported_keys(),
+							touch: hid.supported_touch(),
+							axes: hid.supported_axes(),
+						},
+						hid,
+					),
+				))
+			})
+			.collect::<Result<HashMap<_, _>>>()
+			.context("failed to parse hid devices")?;
 
 		let events_addr = SocketAddrV6::new(
 			*head_unit.addr.ip(),
@@ -247,6 +297,7 @@ impl CarplayNetSession {
 
 			next_connection_id: 1,
 			modes: ModesMachine::new(),
+			hid,
 
 			control,
 			events: Some(events),
@@ -256,6 +307,10 @@ impl CarplayNetSession {
 
 	pub fn video_params(&self) -> VideoParams {
 		self.video_params
+	}
+
+	pub fn input_devices(&self) -> Vec<InputDevice> {
+		self.hid.values().map(|x| x.0.clone()).collect()
 	}
 
 	async fn command(&mut self, command: DeviceCommand) -> Result<()> {
@@ -508,6 +563,43 @@ impl CarplayNetSession {
 
 				Response::ok()
 			}
+			AccessoryCommand::HidSendReport(report) => {
+				let ret = async {
+					let (device, hid) = self
+						.hid
+						.get_mut(&report.uuid)
+						.context("no hid device found with uuid")?;
+
+					let event = hid
+						.parse(Instant::now(), report.hid_report.as_ref())
+						.context("failed to parse hid report")?;
+
+					let proxy = self.proxy.borrow().clone();
+					if let Some(proxy) = proxy {
+						if !event.is_empty() {
+							proxy
+								.process_input(device.clone(), event)
+								.await
+								.context("failed to process input")?;
+						}
+					} else {
+						// No downstream state exists yet. Avoid retaining a press
+						// whose release would later arrive without its initial down.
+						let _ = hid.flush(Instant::now());
+					}
+
+					anyhow::Ok(())
+				}
+				.await;
+
+				match ret {
+					Ok(()) => Response::ok(),
+					Err(err) => {
+						warn!("hid report send failed {err:?}");
+						Response::new(500, "Internal Server Error")
+					}
+				}
+			}
 			AccessoryCommand::Unknown { r#type, body } => {
 				warn!("unknown command {type} {body:?}");
 				Response::new(418, "I'm a teapot")
@@ -533,6 +625,21 @@ impl CarplayNetSession {
 	}
 
 	pub async fn run(mut self) -> Result<()> {
+		let result = self.run_inner().await;
+		let proxy = self.proxy.borrow().clone();
+		if let Some(proxy) = proxy {
+			for (device, hid) in self.hid.values_mut() {
+				if let Some(report) = hid.flush(Instant::now()) {
+					if let Err(err) = proxy.process_input(device.clone(), report).await {
+						warn!("failed to release network input {err:?}");
+					}
+				}
+			}
+		}
+		result
+	}
+
+	async fn run_inner(&mut self) -> Result<()> {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let events = self.events.take().unwrap();
 		let mut streams = NetSessionStreamFutures::new();

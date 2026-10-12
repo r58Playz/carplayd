@@ -36,3 +36,4 @@ plist = "1.10.0"
 serde = { version = "1.0.229", features = ["derive"] }
 async-trait = "0.1.92"
 serde_json = "1.0.152"
+hidreport = "0.6.0"

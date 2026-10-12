@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Stream a portal-created KDE virtual monitor to carplayd, with an H.264 preview. (codex testing thing)"""
+"""Stream a KDE virtual monitor to carplayd, preview video and emulate provider input."""
 
 import argparse
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 import json
 import logging
 import math
@@ -23,8 +24,29 @@ MAX_ACCESS_UNIT = 4 * 1024 * 1024
 PORTAL_NAME = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
 SCREENCAST = "org.freedesktop.portal.ScreenCast"
+REMOTE_DESKTOP = "org.freedesktop.portal.RemoteDesktop"
 REQUEST = "org.freedesktop.portal.Request"
 SESSION = "org.freedesktop.portal.Session"
+# RemoteDesktop device permission bits and Linux evdev button code.
+KEYBOARD, POINTER = 1, 2
+BTN_LEFT = 0x110
+# Linux evdev keyboard codes, passed without the X11 keycode offset.
+# Primary is a keyboard selection (Enter); touch contacts drive pointer clicks.
+KEY_CODES = {
+    "Play": 207, "Pause": 201, "NextTrack": 163, "PreviousTrack": 165,
+    "Shuffle": 0x19A, "Repeat": 0x1B7, "TrackingNormal": 207,
+    "TrackingIncrement": 0x1B5, "TrackingDecrement": 0x1B4,
+    "PlayPause": 164, "Mute": 113, "VolumeUp": 115, "VolumeDown": 114,
+    "Promote": 0x16C, "Demote": 14, "AddToCart": 221,
+    "Home": 172, "Back": 158, "NavGuidance": 0x288, "Backspace": 14,
+    "HookSwitch": 0x1BD, "Flash": 169, "Drop": 0x1BE, "PhoneMute": 248,
+    **{f"PhoneKey{n}": 0x200 + n for n in range(10)},
+    "PhoneKeyStar": 0x20A, "PhoneKeyPound": 0x20B, "Primary": 28,
+}
+DEVICE_COLORS = (
+    (0.25, 0.75, 1.0), (1.0, 0.65, 0.25), (0.45, 0.9, 0.55),
+    (0.85, 0.5, 1.0), (1.0, 0.45, 0.6),
+)
 
 
 def recv_exact(sock, length):
@@ -51,6 +73,251 @@ def positive_integer(value, name, maximum):
     if type(value) is not int or not 0 < value <= maximum:
         raise ValueError(f"invalid {name}: {value!r}")
     return value
+
+
+def message_type(message):
+    kind = message.get("type")
+    if kind not in ("init", "display_request", "input_event"):
+        raise ValueError(f"unknown provider message type: {kind!r}")
+    return kind
+
+
+@dataclass
+class ContactState:
+    x: float
+    y: float
+    touching: bool
+    updated_at: float
+    trail: deque = field(default_factory=lambda: deque(maxlen=32))
+
+
+@dataclass
+class DeviceState:
+    identity: str
+    descriptor: object
+    number: int
+    contacts: dict = field(default_factory=dict)
+    held_keys: set = field(default_factory=set)
+    axes: dict = field(default_factory=dict)
+
+    @property
+    def surface(self):
+        if isinstance(self.descriptor, dict):
+            touch = self.descriptor["Network"].get("touch")
+            if touch:
+                return next(iter(touch))
+        return None
+
+    @property
+    def label(self):
+        return f"D{self.number} {self.surface or self.identity}"
+
+    def description(self):
+        if self.identity == "IapRemote":
+            return f"{self.label} — media buttons"
+        info = self.descriptor["Network"]
+        detail = f"{self.label} — {info['id']}"
+        if self.surface:
+            touch = info["touch"][self.surface]
+            detail += f" · {touch['max_touches']} contacts"
+            size = touch.get("physical_size_mm")
+            if size:
+                detail += f" · {size[0]:g}×{size[1]:g} mm"
+        return detail
+
+
+class InputState:
+    """Provider state shared by the visualizer and portal startup replay."""
+
+    def __init__(self):
+        self.devices = {}
+        self.reports = self.events = 0
+
+    def register(self, descriptor):
+        if descriptor == "IapRemote":
+            identity = descriptor
+        elif isinstance(descriptor, dict) and set(descriptor) == {"Network"}:
+            info = descriptor["Network"]
+            if not isinstance(info, dict) or not isinstance(info.get("id"), str):
+                raise ValueError("invalid network input device")
+            identity = "Network:" + info["id"]
+            touch = info.get("touch")
+            if touch is not None and (
+                not isinstance(touch, dict) or len(touch) != 1
+                or next(iter(touch)) not in ("Touchscreen", "Touchpad")
+            ):
+                raise ValueError("invalid input surface capability")
+        else:
+            raise ValueError(f"unknown input device: {descriptor!r}")
+        if identity not in self.devices:
+            self.devices[identity] = DeviceState(identity, descriptor, len(self.devices) + 1)
+        device = self.devices[identity]
+        device.descriptor = descriptor
+        return device
+
+    def apply(self, descriptor, events):
+        device = self.register(descriptor)
+        if not isinstance(events, list):
+            raise ValueError("input events must be a list")
+        now = time.monotonic()
+        for event in events:
+            if not isinstance(event, dict) or len(event) != 1:
+                raise ValueError("invalid input event")
+            kind, value = next(iter(event.items()))
+            if not isinstance(value, dict):
+                raise ValueError("invalid input event payload")
+            if kind == "Key":
+                key, pressed = value.get("key"), value.get("pressed")
+                if not isinstance(key, str) or type(pressed) is not bool:
+                    raise ValueError("invalid key event")
+                if pressed:
+                    device.held_keys.add(key)
+                else:
+                    device.held_keys.discard(key)
+            elif kind == "TouchEvent":
+                contacts = value.get("contacts")
+                if not isinstance(contacts, list):
+                    raise ValueError("invalid touch contacts")
+                for contact in contacts:
+                    if not isinstance(contact, dict):
+                        raise ValueError("invalid touch contact")
+                    cid, x, y = contact.get("id"), contact.get("x"), contact.get("y")
+                    touching = contact.get("touching")
+                    if (type(cid) is not int or not 0 <= cid <= 0xFFFFFFFF
+                        or type(touching) is not bool
+                        or type(x) not in (int, float) or not math.isfinite(x)
+                        or type(y) not in (int, float) or not math.isfinite(y)):
+                        raise ValueError("invalid touch coordinates or state")
+                    x, y = min(1.0, max(0.0, x)), min(1.0, max(0.0, y))
+                    previous = device.contacts.get(cid)
+                    if previous is None or (touching and not previous.touching):
+                        previous = ContactState(x, y, touching, now)
+                        device.contacts[cid] = previous
+                    previous.x, previous.y = x, y
+                    previous.touching, previous.updated_at = touching, now
+                    previous.trail.append((x, y))
+            elif kind == "Axis":
+                aid, axis_value = value.get("id"), value.get("value")
+                if type(aid) is not int or type(axis_value) is not int:
+                    raise ValueError("invalid axis event")
+                device.axes[aid] = axis_value
+            else:
+                raise ValueError(f"unknown input event: {kind!r}")
+        self.reports += 1
+        self.events += len(events)
+        return device
+
+    def snapshot(self, device):
+        events = [{"Key": {"key": key, "pressed": True}} for key in sorted(device.held_keys)]
+        contacts = [
+            {"id": cid, "x": c.x, "y": c.y, "touching": True}
+            for cid, c in device.contacts.items() if c.touching
+        ]
+        if contacts:
+            events.append({"TouchEvent": {"contacts": contacts}})
+        return events
+
+    def prune(self):
+        now = time.monotonic()
+        for device in self.devices.values():
+            device.contacts = {
+                cid: c for cid, c in device.contacts.items()
+                if c.touching or now - c.updated_at < 1.5
+            }
+
+
+class InputEmulator:
+    """Translate normalized input into stream-local portal input events."""
+
+    def __init__(self, portal, params, on_log):
+        self.portal, self.params, self.on_log = portal, params, on_log
+        self.keys = {}
+        self.pointer_contacts = {}
+        self.pointer_down = False
+        self.pointer_position = None
+        self.warned = set()
+
+    def _warn(self, message):
+        if message not in self.warned:
+            self.warned.add(message)
+            self.on_log(message)
+
+    def _coordinates(self, contact):
+        # KDE creates virtual outputs at scale 1. Their initial portal size can
+        # be stale after PipeWire negotiation resizes the output to CarPlay.
+        width, height = self.portal.logical_size or self.portal.properties.get("size") or (
+            self.params.width, self.params.height
+        )
+        return (
+            min(1.0, max(0.0, contact["x"])) * max(0, width - 1),
+            min(1.0, max(0.0, contact["y"])) * max(0, height - 1),
+        )
+
+    def process(self, device, events):
+        for event in events:
+            kind, value = next(iter(event.items()))
+            if kind == "Key":
+                self._key(device, value)
+            elif kind == "TouchEvent":
+                for contact in value["contacts"]:
+                    self._touch(device, contact)
+                self._pointer()
+            elif kind == "Axis":
+                self._warn(f"{device.label}: axis {value['id']} is visualized only")
+
+    def _key(self, device, event):
+        key, pressed = event["key"], event["pressed"]
+        code = KEY_CODES.get(key)
+        if code is None:
+            self._warn(f"{device.label}: no keyboard mapping for {key}")
+            return
+        if not self.portal.devices & KEYBOARD:
+            self._warn("Portal keyboard access was not granted")
+            return
+        source = (device.identity, key)
+        holders = self.keys.setdefault(code, set())
+        was_pressed = bool(holders)
+        if pressed:
+            holders.add(source)
+        else:
+            holders.discard(source)
+        if bool(holders) != was_pressed:
+            self.portal.notify("NotifyKeyboardKeycode", "(oa{sv}iu)", code, int(bool(holders)))
+        if not holders:
+            self.keys.pop(code, None)
+
+    def _touch(self, device, contact):
+        identity = (device.identity, contact["id"])
+        if self.portal.devices & POINTER:
+            if not self.pointer_contacts or identity == next(iter(self.pointer_contacts)):
+                self.pointer_position = self._coordinates(contact)
+            if contact["touching"]:
+                self.pointer_contacts[identity] = self._coordinates(contact)
+            else:
+                self.pointer_contacts.pop(identity, None)
+        else:
+            self._warn("Portal pointer access was not granted")
+
+    def _pointer(self):
+        down = bool(self.pointer_contacts)
+        if down:
+            self.pointer_position = next(iter(self.pointer_contacts.values()))
+        if self.pointer_position is not None:
+            x, y = self.pointer_position
+            self.portal.notify("NotifyPointerMotionAbsolute", "(oa{sv}udd)", self.portal.node_id, x, y)
+        if down != self.pointer_down:
+            self.portal.notify("NotifyPointerButton", "(oa{sv}iu)", BTN_LEFT, int(down))
+            self.pointer_down = down
+
+    def release(self):
+        for code in self.keys:
+            self.portal.notify("NotifyKeyboardKeycode", "(oa{sv}iu)", code, 0)
+        if self.pointer_down:
+            self.portal.notify("NotifyPointerButton", "(oa{sv}iu)", BTN_LEFT, 0)
+        self.keys.clear()
+        self.pointer_contacts.clear()
+        self.pointer_down = False
+        self.pointer_position = None
 
 
 @dataclass(frozen=True)
@@ -119,7 +386,7 @@ def check_plugins(test_source=False):
 
 
 class ScreenCastPortal:
-    """One portal session, retained across provider screen requests."""
+    """One combined remote desktop/screen cast session, retained across requests."""
 
     def __init__(self, on_ready, on_error):
         self.on_ready = on_ready
@@ -129,6 +396,10 @@ class ScreenCastPortal:
         self.pending_path = None
         self.pending_callback = None
         self.closed = False
+        self.devices = 0
+        self.node_id = None
+        self.properties = {}
+        self.logical_size = None
         self.subscriptions = [
             self.connection.signal_subscribe(
                 PORTAL_NAME, REQUEST, "Response", None, None,
@@ -146,7 +417,7 @@ class ScreenCastPortal:
             Gio.DBusCallFlags.NONE, timeout, None,
         )
 
-    def _request(self, method, signature, arguments, options, callback):
+    def _request(self, interface, method, signature, arguments, options, callback):
         token = "carplayd_" + uuid.uuid4().hex
         options = dict(options, handle_token=GLib.Variant("s", token))
         sender = self.connection.get_unique_name()[1:].replace(".", "_")
@@ -154,7 +425,7 @@ class ScreenCastPortal:
         self.pending_callback = callback
         # Subscribe before calling: Response can arrive before the method returns.
         reply = self._call(
-            PORTAL_PATH, SCREENCAST, method,
+            PORTAL_PATH, interface, method,
             GLib.Variant(signature, (*arguments, options)),
         )
         self.pending_path = reply.unpack()[0]
@@ -168,14 +439,14 @@ class ScreenCastPortal:
         try:
             if response:
                 reason = "cancelled" if response == 1 else "failed"
-                raise RuntimeError(f"screen sharing {reason} (portal response {response})")
+                raise RuntimeError(f"screen/input sharing {reason} (portal response {response})")
             callback(results)
         except Exception as exc:
             self.on_error(str(exc))
 
     def _session_closed(self, connection, sender, path, interface, signal_name, parameters):
         if not self.closed and path == self.session:
-            self.on_error("screen sharing was stopped by the desktop portal")
+            self.on_error("screen/input sharing was stopped by the desktop portal")
 
     def start(self):
         properties = self._call(
@@ -187,18 +458,31 @@ class ScreenCastPortal:
         modes = properties.get("AvailableCursorModes", 1)
         if not modes & 2:
             raise RuntimeError("the portal cannot embed the cursor in the video stream")
+        input_properties = self._call(
+            PORTAL_PATH, "org.freedesktop.DBus.Properties", "GetAll",
+            GLib.Variant("(s)", (REMOTE_DESKTOP,)),
+        ).unpack()[0]
+        self.available_devices = input_properties.get("AvailableDeviceTypes", 0) & (KEYBOARD | POINTER)
+        if self.available_devices != KEYBOARD | POINTER:
+            raise RuntimeError("the RemoteDesktop portal must support keyboard and pointer input")
         token = "carplayd_" + uuid.uuid4().hex
         sender = self.connection.get_unique_name()[1:].replace(".", "_")
         self.session = f"{PORTAL_PATH}/session/{sender}/{token}"
         self._request(
-            "CreateSession", "(a{sv})", (),
+            REMOTE_DESKTOP, "CreateSession", "(a{sv})", (),
             {"session_handle_token": GLib.Variant("s", token)}, self._created,
         )
 
     def _created(self, results):
         self.session = results["session_handle"]
         self._request(
-            "SelectSources", "(oa{sv})", (self.session,),
+            REMOTE_DESKTOP, "SelectDevices", "(oa{sv})", (self.session,),
+            {"types": GLib.Variant("u", self.available_devices)}, self._devices_selected,
+        )
+
+    def _devices_selected(self, results):
+        self._request(
+            SCREENCAST, "SelectSources", "(oa{sv})", (self.session,),
             {
                 "types": GLib.Variant("u", 4),
                 "multiple": GLib.Variant("b", False),
@@ -209,7 +493,7 @@ class ScreenCastPortal:
         )
 
     def _selected(self, results):
-        self._request("Start", "(osa{sv})", (self.session, ""), {}, self._started)
+        self._request(REMOTE_DESKTOP, "Start", "(osa{sv})", (self.session, ""), {}, self._started)
 
     def _started(self, results):
         streams = results.get("streams", [])
@@ -218,8 +502,30 @@ class ScreenCastPortal:
         node_id, properties = streams[0]
         if properties.get("source_type", 4) != 4:
             raise RuntimeError("the portal returned a source other than a virtual monitor")
+        self.devices = results.get("devices", 0)
+        self.node_id, self.properties = node_id, properties
         LOG.info("Virtual monitor: PipeWire node %s, initial properties %s", node_id, properties)
+        LOG.info("Portal input permissions: keyboard=%s pointer=%s",
+                 bool(self.devices & KEYBOARD), bool(self.devices & POINTER))
         self.on_ready(node_id, properties)
+
+    def notify(self, method, signature, *arguments):
+        if self.closed or self.node_id is None:
+            return
+        # Asynchronous calls keep a slow portal from blocking video/UI updates.
+        # D-Bus preserves their send order, including press/motion/release.
+        self.connection.call(
+            PORTAL_NAME, PORTAL_PATH, REMOTE_DESKTOP, method,
+            GLib.Variant(signature, (self.session, {}, *arguments)), None,
+            Gio.DBusCallFlags.NONE, 5000, None, self._notified,
+        )
+
+    def _notified(self, connection, result):
+        try:
+            connection.call_finish(result)
+        except GLib.Error as exc:
+            if not self.closed:
+                self.on_error(f"portal input emulation failed: {exc.message}")
 
     def open_remote(self):
         reply, fd_list = self.connection.call_with_unix_fd_list_sync(
@@ -380,24 +686,127 @@ class Client:
         self.params = self.portal = self.stream = self.pending_socket = None
         self.node_id = self.properties = None
         self.pixbuf = None
+        self.input = InputState()
+        self.emulator = None
         self.source_ready = args.test_source
         self.stopped = threading.Event()
         self.sockets = set()
         self.socket_lock = threading.Lock()
         self.exit_code = 0
-        self.window = Gtk.Window(title="carplayd — transmitted H.264")
-        self.window.set_default_size(960, 540)
+        self.window = Gtk.Window(title="carplayd — debug provider")
+        self.window.set_default_size(1280, 760)
         self.window.connect("delete-event", lambda *_: self.stop())
         self.window.connect("key-press-event", self._key)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(10)
+        sections = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box.pack_start(sections, True, True, 0)
+
+        screen_frame = Gtk.Frame(label="Screen — transmitted H.264")
+        screen_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        screen_box.set_border_width(8)
         self.drawing = Gtk.DrawingArea()
+        self.drawing.set_size_request(480, 300)
         self.drawing.connect("draw", self._draw)
-        box.pack_start(self.drawing, True, True, 0)
+        screen_box.pack_start(self.drawing, True, True, 0)
+        self.screen_info = self._label("Waiting for provider display parameters…")
+        screen_box.pack_start(self.screen_info, False, False, 0)
+        screen_frame.add(screen_box)
+        sections.pack_start(screen_frame, True, True, 0)
+
+        input_frame = Gtk.Frame(label="Input — contacts and buttons")
+        input_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        input_box.set_border_width(8)
+        input_box.set_size_request(360, -1)
+        self.device_info = self._label("Waiting for input devices…")
+        self.device_info.set_max_width_chars(46)
+        device_scroll = Gtk.ScrolledWindow()
+        device_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        device_scroll.set_size_request(-1, 60)
+        device_scroll.add(self.device_info)
+        input_box.pack_start(device_scroll, False, True, 0)
+        surface_frame = Gtk.AspectFrame(label="Touchscreen / touchpad · normalized 0–1",
+                                        xalign=0.5, yalign=0.5, ratio=1.0, obey_child=False)
+        self.input_drawing = Gtk.DrawingArea()
+        self.input_drawing.set_size_request(300, 300)
+        self.input_drawing.connect("draw", self._draw_input)
+        surface_frame.add(self.input_drawing)
+        input_box.pack_start(surface_frame, False, True, 0)
+        self.input_status = self._label("0 reports · 0 events · 0 active contacts\nHeld buttons: none")
+        input_box.pack_start(self.input_status, False, False, 0)
+        self.emulation_status = self._label(
+            "Emulation disabled for test source" if args.test_source else "Waiting for portal input access…"
+        )
+        input_box.pack_start(self.emulation_status, False, False, 0)
+        log_frame = Gtk.Frame(label="Button / axis log")
+        log_scroll = Gtk.ScrolledWindow()
+        log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        log_scroll.set_size_request(-1, 120)
+        self.input_log = Gtk.TextView()
+        self.input_log.set_editable(False)
+        self.input_log.set_cursor_visible(False)
+        self.input_log.set_monospace(True)
+        self.input_log.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_buffer = self.input_log.get_buffer()
+        self.log_end = self.log_buffer.create_mark(None, self.log_buffer.get_end_iter(), False)
+        log_scroll.add(self.input_log)
+        log_frame.add(log_scroll)
+        input_box.pack_start(log_frame, True, True, 0)
+        input_frame.add(input_box)
+        sections.pack_start(input_frame, False, True, 0)
+
         self.status = Gtk.Label(label=f"Connecting to {args.host}:{args.port}…")
-        self.status.set_margin_top(6)
-        self.status.set_margin_bottom(6)
         box.pack_start(self.status, False, False, 0)
         self.window.add(box)
+
+    @staticmethod
+    def _label(text):
+        label = Gtk.Label(label=text)
+        label.set_xalign(0)
+        label.set_selectable(True)
+        label.set_line_wrap(True)
+        return label
+
+    def _append_log(self, message):
+        self.log_buffer.insert(self.log_buffer.get_end_iter(), f"{time.strftime('%H:%M:%S')} {message}\n")
+        if self.log_buffer.get_line_count() > 400:
+            self.log_buffer.delete(self.log_buffer.get_start_iter(), self.log_buffer.get_iter_at_line(1))
+        self.input_log.scroll_mark_onscreen(self.log_end)
+        LOG.info("Input: %s", message)
+
+    def _update_input_info(self):
+        devices = self.input.devices.values()
+        self.device_info.set_text("\n".join(d.description() for d in devices) or "No input devices advertised")
+        held = [f"D{d.number}:{key}" for d in devices for key in sorted(d.held_keys)]
+        active = sum(c.touching for d in devices for c in d.contacts.values())
+        self.input_status.set_text(
+            f"{self.input.reports} reports · {self.input.events} events · {active} active contacts\n"
+            f"Held buttons: {', '.join(held) or 'none'}"
+        )
+
+    def _input_received(self, message):
+        if self.stopped.is_set():
+            return False
+        try:
+            events = message.get("events")
+            device = self.input.apply(message.get("device"), events)
+            for event in events:
+                if "Key" in event:
+                    key = event["Key"]
+                    state = "pressed" if key["pressed"] else "released"
+                    code = KEY_CODES.get(key["key"])
+                    mapping = f" → keyboard {code}" if code is not None else " (unmapped)"
+                    self._append_log(f"D{device.number} {key['key']} {state}{mapping}")
+                elif "Axis" in event:
+                    axis = event["Axis"]
+                    self._append_log(f"D{device.number} axis {axis['id']} = {axis['value']}")
+            self._update_input_info()
+            self.input_drawing.queue_draw()
+            if self.emulator:
+                self.emulator.process(device, events)
+        except Exception as exc:
+            self.fail(str(exc))
+        return False
 
     def _connect(self, port):
         sock = socket.create_connection((self.args.host, port), self.args.timeout)
@@ -417,29 +826,47 @@ class Client:
     def _control(self):
         try:
             control = self._connect(self.args.port)
-            params = VideoParams.from_message(recv_message(control))
+            initial = recv_message(control)
+            if message_type(initial) != "init":
+                raise ValueError("expected an init message from the provider")
+            params = VideoParams.from_message(initial)
             control.settimeout(None)
-            GLib.idle_add(self._initialized, params)
+            GLib.idle_add(self._initialized, params, initial.get("input_devices", []))
             while not self.stopped.is_set():
                 message = recv_message(control)
-                port = positive_integer(message.get("port"), "display port", 65535)
-                # Connect immediately so the provider can complete get_screen().
-                display = self._connect(port)
-                GLib.idle_add(self._display_requested, display)
+                kind = message_type(message)
+                if kind == "display_request":
+                    port = positive_integer(message.get("port"), "display port", 65535)
+                    # Connect immediately so the provider can complete get_screen().
+                    display = self._connect(port)
+                    GLib.idle_add(self._display_requested, display)
+                elif kind == "input_event":
+                    GLib.idle_add(self._input_received, message)
+                else:
+                    raise ValueError("unexpected second init message")
         except Exception as exc:
             if not self.stopped.is_set():
                 GLib.idle_add(self.fail, str(exc))
 
-    def _initialized(self, params):
+    def _initialized(self, params, input_devices):
         if self.stopped.is_set():
             return False
         self.params = params
         LOG.info("Provider display: %s×%s at %s fps", params.width, params.height, params.fps)
         try:
+            if not isinstance(input_devices, list):
+                raise ValueError("input_devices must be a list")
+            for device in input_devices:
+                self.input.register(device)
+            self._update_input_info()
+            self.screen_info.set_text(
+                f"Provider: {params.width}×{params.height} · {params.fps} fps\n"
+                f"Encoder: H.264 · {self.args.bitrate} kbit/s target\nNo display stream requested"
+            )
             if self.args.test_source:
                 self.status.set_text("Test source ready; waiting for a display request…")
             else:
-                self.status.set_text("Choose New Virtual Output in the KDE screen sharing dialog…")
+                self.status.set_text("Allow virtual monitor sharing and input in the KDE portal dialog…")
                 self.portal = ScreenCastPortal(self._portal_ready, self.fail)
                 self.portal.start()
         except Exception as exc:
@@ -449,6 +876,12 @@ class Client:
     def _portal_ready(self, node_id, properties):
         self.node_id, self.properties = node_id, properties
         self.source_ready = True
+        self.emulator = InputEmulator(self.portal, self.params, self._append_log)
+        granted = [name for bit, name in ((KEYBOARD, "keyboard"), (POINTER, "pointer"))
+                   if self.portal.devices & bit]
+        self.emulation_status.set_text(f"Portal emulation: {', '.join(granted) or 'no input access granted'}")
+        for device in self.input.devices.values():
+            self.emulator.process(device, self.input.snapshot(device))
         self.status.set_text("Virtual monitor ready; waiting for a display request…")
         self._start_stream()
 
@@ -481,6 +914,7 @@ class Client:
             self.pending_socket = None
             self.pixbuf = None
             self.stream.start(self.node_id, self.properties, self.args.test_source)
+            self._stats()
             self.status.set_text("Streaming; waiting for the first encoded frame…")
             LOG.info("Streaming H.264 at %s kbit/s", self.args.bitrate)
         except Exception as exc:
@@ -499,12 +933,21 @@ class Client:
     def _refresh(self):
         if self.stopped.is_set():
             return False
+        self.input.prune()
+        self.input_drawing.queue_draw()
         if self.stream:
             try:
                 sample = self.stream.pull_preview()
                 if sample:
+                    first_preview = self.pixbuf is None
                     buffer = sample.get_buffer()
                     info = GstVideo.VideoInfo.new_from_caps(sample.get_caps())
+                    if self.portal and self.portal.logical_size != (info.width, info.height):
+                        self.portal.logical_size = (info.width, info.height)
+                        # Reposition contacts held while the virtual output was
+                        # still at its initial size, without pressing again.
+                        for device in self.input.devices.values():
+                            self.emulator.process(device, self.input.snapshot(device))
                     meta = GstVideo.buffer_get_video_meta(buffer)
                     offset = meta.offset[0] if meta else info.offset[0]
                     stride = meta.stride[0] if meta else info.stride[0]
@@ -514,6 +957,8 @@ class Client:
                         info.width, info.height, stride,
                     )
                     self.drawing.queue_draw()
+                    if first_preview:
+                        self._stats()
             except Exception as exc:
                 self.fail(str(exc))
                 return False
@@ -522,14 +967,18 @@ class Client:
     def _stats(self):
         if self.stopped.is_set():
             return False
-        if self.stream and self.stream.frames:
+        if self.stream:
             stream = self.stream
             elapsed = max(time.monotonic() - stream.started_at, 0.001)
             p = self.params
-            self.status.set_text(
-                f"{p.width}×{p.height} · {p.fps} fps · {stream.frames} frames sent · "
-                f"{stream.bytes_sent * 8 / elapsed / 1000:.0f} kbit/s · Esc to stop"
+            source = "Test pattern" if self.args.test_source else f"Virtual monitor · PipeWire node {self.node_id}"
+            self.screen_info.set_text(
+                f"Provider: {p.width}×{p.height} · {p.fps} fps target · {stream.frames / elapsed:.1f} fps sent\n"
+                f"H.264: {stream.frames} frames · {stream.bytes_sent / 1024 / 1024:.1f} MiB · "
+                f"{stream.bytes_sent * 8 / elapsed / 1000:.0f} kbit/s ({self.args.bitrate} target)\n{source}"
             )
+            if stream.frames:
+                self.status.set_text("Streaming video and receiving input · Esc to stop")
         return True
 
     def _draw(self, widget, context):
@@ -543,6 +992,51 @@ class Client:
             context.scale(scale, scale)
             Gdk.cairo_set_source_pixbuf(context, self.pixbuf, 0, 0)
             context.paint()
+        return False
+
+    def _draw_input(self, widget, context):
+        width, height = widget.get_allocated_width(), widget.get_allocated_height()
+        context.set_source_rgb(0.08, 0.09, 0.12)
+        context.paint()
+        side = max(1, min(width, height) - 36)
+        left, top = (width - side) / 2, (height - side) / 2
+        context.set_line_width(1)
+        context.set_source_rgb(0.25, 0.28, 0.33)
+        for n in range(5):
+            position = side * n / 4
+            context.move_to(left + position, top)
+            context.line_to(left + position, top + side)
+            context.move_to(left, top + position)
+            context.line_to(left + side, top + position)
+        context.stroke()
+        context.set_source_rgb(0.7, 0.73, 0.8)
+        context.set_font_size(11)
+        context.move_to(left, top - 5)
+        context.show_text("0,0")
+        context.move_to(left + side - 20, top + side + 14)
+        context.show_text("1,1")
+        now = time.monotonic()
+        for device in self.input.devices.values():
+            color = DEVICE_COLORS[(device.number - 1) % len(DEVICE_COLORS)]
+            for cid, contact in device.contacts.items():
+                opacity = 1.0 if contact.touching else max(0, 1 - (now - contact.updated_at) / 1.5)
+                context.set_source_rgba(*color, opacity * 0.5)
+                context.set_line_width(2)
+                for i, (x, y) in enumerate(contact.trail):
+                    if i == 0:
+                        context.move_to(left + x * side, top + y * side)
+                    else:
+                        context.line_to(left + x * side, top + y * side)
+                context.stroke()
+                x, y = left + contact.x * side, top + contact.y * side
+                context.set_source_rgba(*color, opacity)
+                context.arc(x, y, 7, 0, 2 * math.pi)
+                if contact.touching:
+                    context.fill()
+                else:
+                    context.stroke()
+                context.move_to(min(x + 10, left + side - 60), max(y - 10, top + 12))
+                context.show_text(f"D{device.number}:{cid}")
         return False
 
     def _key(self, widget, event):
@@ -567,6 +1061,11 @@ class Client:
         for sock in sockets:
             close_socket(sock)
         self._stop_stream()
+        if self.emulator:
+            try:
+                self.emulator.release()
+            except Exception as exc:
+                LOG.warning("Could not release portal input: %s", exc)
         if self.portal:
             self.portal.close()
         self.window.destroy()

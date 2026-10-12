@@ -5,7 +5,9 @@ use futures::future::join;
 use log::{LevelFilter, debug, info, warn};
 use mdns_sd::{IfKind, ServiceDaemon};
 use tokio::{
-	fs, sync::{mpsc, watch}, task::{JoinSet, spawn_blocking},
+	fs,
+	sync::{mpsc, watch},
+	task::{JoinSet, spawn_blocking},
 };
 
 use crate::{
@@ -20,7 +22,10 @@ use crate::{
 			head_unit::{HeadUnitUsb, find_iap2_device},
 			ncm::{configure_ncm, get_ncm_device_name},
 		},
-	}, gadget::{run_gadget, udc_name}, pairing::identity::{PairIdentity, PairingStore}, provider::network::CarplayDebugNetworkProvider,
+	},
+	gadget::{run_gadget, udc_name},
+	pairing::identity::{PairIdentity, PairingStore},
+	provider::network::CarplayDebugNetworkProvider,
 };
 
 mod carplay;
@@ -127,7 +132,7 @@ async fn main() -> Result<()> {
 	// run usb and net in parallel for time reasons
 	let (r1, r2) = join(
 		async {
-			let usb = CarplayUsbSession::new(&identity, &head_unit_usb)
+			let usb = CarplayUsbSession::new(&identity, &head_unit_usb, watch_rx.clone())
 				.await
 				.context("failed to establish the iAP2 session")?;
 			set.spawn(wrap("usb task", usb.run()));
@@ -153,7 +158,8 @@ async fn main() -> Result<()> {
 
 			anyhow::Ok(link)
 		},
-	).await;
+	)
+	.await;
 	r1?;
 	let link = r2?;
 

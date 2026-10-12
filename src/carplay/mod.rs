@@ -4,20 +4,26 @@ use tokio::{select, sync::watch, task::JoinSet};
 
 use crate::{
 	carplay::{
+		input::InputDevice,
 		net::{
 			CarplayNetSession,
 			head_unit::HeadUnitServer,
 			timing::{Clock, TimingServer},
 		},
 		usb::ncm::NcmLink,
-	}, pairing::identity::{PairIdentity, PairingStore}, provider::{
-		CarplayProvider, CarplayProviderConnection, CarplayProviderConnectionProxy, CarplayProviderConnectionServer, CarplayProviderScreen,
-	}, v4l2::VideoParams,
+	},
+	pairing::identity::{PairIdentity, PairingStore},
+	provider::{
+		CarplayProvider, CarplayProviderConnection, CarplayProviderConnectionProxy,
+		CarplayProviderConnectionServer, CarplayProviderScreen,
+	},
+	v4l2::VideoParams,
 };
 
 pub mod ctrl_server;
 pub mod encoder;
 mod h264;
+pub mod input;
 pub mod modes;
 pub mod net;
 pub mod usb;
@@ -56,9 +62,8 @@ pub struct DeviceIdentity {
 }
 
 pub struct CarplaySession {
-	clock: Clock,
-	device: DeviceIdentity,
 	video: VideoParams,
+	input: Vec<InputDevice>,
 	provider_tx: watch::Sender<Option<CarplayProviderConnectionProxy>>,
 }
 impl CarplaySession {
@@ -100,11 +105,13 @@ impl CarplaySession {
 		.await
 		.context("failed to establish the CarPlay session")?;
 
+		let mut input = net.input_devices();
+		input.push(InputDevice::IapRemote);
+
 		Ok((
 			Self {
-				clock,
-				device,
 				video: net.video_params(),
+				input,
 				provider_tx,
 			},
 			net,
@@ -119,9 +126,14 @@ impl CarplaySession {
 		self,
 		mut provider: P,
 	) -> Result<()> {
-		let conn = provider.wait_for_connection(self.video).await.context("failed to wait for connection")?;
+		let conn = provider
+			.wait_for_connection(self.video, self.input.clone())
+			.await
+			.context("failed to wait for connection")?;
 		let (server, proxy) = CarplayProviderConnectionServer::new(conn);
-		self.provider_tx.send(Some(proxy)).context("failed to publish provider")?;
+		self.provider_tx
+			.send(Some(proxy))
+			.context("failed to publish provider")?;
 
 		select! {
 			_ = server.run() => bail!("server ended"),

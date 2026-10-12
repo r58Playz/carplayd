@@ -23,12 +23,13 @@ use tokio_util::{
 use v4l2r::ioctl::PlaneMapping;
 
 use crate::{
+	carplay::input::{InputDevice, InputReport},
 	provider::{
 		CarplayProvider, CarplayProviderConnection, CarplayProviderScreen,
 		decoder::{
 			VideoDecoderConfig, VideoDecoderInput, VideoDecoderOutput, create_video_decoder,
 		},
-		network::protocol::{DisplayRequestMessage, InitMessage},
+		network::protocol::ProviderMessage,
 	},
 	v4l2::VideoParams,
 };
@@ -40,12 +41,14 @@ const V4L2_DEVICE: &str = "/dev/video10";
 enum ProviderEvent {
 	Command(BytesMut),
 	GetScreen(oneshot::Sender<Result<CarplayDebugNetworkProviderScreen>>),
+	ProcessInput(InputDevice, InputReport, oneshot::Sender<Result<()>>),
 }
 
 pub struct CarplayDebugNetworkProvider {
 	port: u16,
 	stream: Option<Framed<TcpStream, LengthDelimitedCodec>>,
 	video: Option<VideoParams>,
+	input: Option<Vec<InputDevice>>,
 	ctrl: Option<mpsc::UnboundedReceiver<ProviderEvent>>,
 }
 impl CarplayDebugNetworkProvider {
@@ -54,6 +57,7 @@ impl CarplayDebugNetworkProvider {
 			port,
 			stream: None,
 			video: None,
+			input: None,
 			ctrl: None,
 		}
 	}
@@ -61,10 +65,15 @@ impl CarplayDebugNetworkProvider {
 impl CarplayProvider for CarplayDebugNetworkProvider {
 	type Connection = CarplayDebugNetworkProviderConnection;
 
-	async fn wait_for_connection(&mut self, video: VideoParams) -> Result<Self::Connection> {
+	async fn wait_for_connection(
+		&mut self,
+		video: VideoParams,
+		input: Vec<InputDevice>,
+	) -> Result<Self::Connection> {
 		let (tx, rx) = mpsc::unbounded_channel();
 
 		self.video.replace(video);
+		self.input.replace(input);
 		self.ctrl.replace(rx);
 
 		let listener = TcpListener::bind(SocketAddr::new(
@@ -94,15 +103,17 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 
 	async fn run(mut self) -> Result<()> {
 		let video_params = self.video.take().unwrap();
+		let input_devices = self.input.take().unwrap();
 		let mut stream = self.stream.take().unwrap();
 		let mut ctrl = self.ctrl.take().unwrap();
 
 		stream
 			.send(
-				serde_json::to_vec(&InitMessage {
+				serde_json::to_vec(&ProviderMessage::Init {
 					display_width: video_params.width,
 					display_height: video_params.height,
 					display_fps: video_params.fps,
+					input_devices,
 				})
 				.context("failed to serialize")?
 				.into(),
@@ -138,7 +149,7 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 							info!("waiting for display stream connection on 0.0.0.0:{port}");
 							stream
 								.send(
-									serde_json::to_vec(&DisplayRequestMessage { port })
+									serde_json::to_vec(&ProviderMessage::DisplayRequest { port })
 										.context("failed to serialize")?
 										.into(),
 								)
@@ -170,6 +181,25 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 						.await,
 					);
 				}
+				ProviderEvent::ProcessInput(device, report, tx) => {
+					let _ = tx.send(
+						async {
+							stream
+								.send(
+									serde_json::to_vec(&ProviderMessage::InputEvent {
+										device,
+										events: report.events,
+									})
+									.context("failed to serialize")?
+									.into(),
+								)
+								.await
+								.context("failed to send request message")?;
+							Ok(())
+						}
+						.await,
+					);
+				}
 			}
 		}
 	}
@@ -186,6 +216,14 @@ impl CarplayProviderConnection for CarplayDebugNetworkProviderConnection {
 			.send(ProviderEvent::GetScreen(tx))
 			.context("failed to send screen request")?;
 		rx.await.context("failed to wait for screen")?
+	}
+
+	async fn process_input(&mut self, device: InputDevice, events: InputReport) -> Result<()> {
+		let (tx, rx) = oneshot::channel();
+		self.0
+			.send(ProviderEvent::ProcessInput(device, events, tx))
+			.context("failed to send input request")?;
+		rx.await.context("failed to wait for input process")?
 	}
 }
 
