@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream a KDE virtual monitor to carplayd, preview video and emulate provider input."""
+"""Stream a KDE virtual monitor, emulate provider input and forward MPRIS Now Playing."""
 
 import argparse
 from collections import deque
@@ -8,12 +8,15 @@ import json
 import logging
 import math
 import os
+import queue
 import signal
 import socket
 import struct
 import threading
 import time
 import uuid
+
+from mpris import MprisBackend
 
 
 LOG = logging.getLogger("debug-network-client")
@@ -67,6 +70,13 @@ def recv_message(sock):
     if not isinstance(message, dict):
         raise ValueError("expected a JSON object from the provider")
     return message
+
+
+def send_message(sock, message):
+    data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if not 0 < len(data) <= MAX_PACKET:
+        raise ValueError(f"invalid control packet length: {len(data)}")
+    sock.sendall(struct.pack("<I", len(data)) + data)
 
 
 def positive_integer(value, name, maximum):
@@ -688,6 +698,8 @@ class Client:
         self.pixbuf = None
         self.input = InputState()
         self.emulator = None
+        self.media = None
+        self.media_updates = queue.Queue(maxsize=1)
         self.source_ready = args.test_source
         self.stopped = threading.Event()
         self.sockets = set()
@@ -711,6 +723,18 @@ class Client:
         screen_box.pack_start(self.drawing, True, True, 0)
         self.screen_info = self._label("Waiting for provider display parameters…")
         screen_box.pack_start(self.screen_info, False, False, 0)
+        media_frame = Gtk.Frame(label="Now Playing — MPRIS")
+        media_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        media_box.set_border_width(8)
+        self.media_info = self._label("Waiting for a media player…")
+        self.media_info.set_max_width_chars(70)
+        media_box.pack_start(self.media_info, False, False, 0)
+        self.media_progress = Gtk.ProgressBar()
+        self.media_progress.set_show_text(True)
+        self.media_progress.set_text("No media source")
+        media_box.pack_start(self.media_progress, False, False, 0)
+        media_frame.add(media_box)
+        screen_box.pack_start(media_frame, False, False, 0)
         screen_frame.add(screen_box)
         sections.pack_start(screen_frame, True, True, 0)
 
@@ -823,6 +847,48 @@ class Client:
         with self.socket_lock:
             self.sockets.discard(sock)
 
+    def _send_media(self, control):
+        try:
+            while not self.stopped.is_set():
+                try:
+                    snapshot = self.media_updates.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                send_message(control, {"type": "now_playing_update", "now_playing": snapshot})
+        except Exception as exc:
+            if not self.stopped.is_set():
+                GLib.idle_add(self.fail, f"could not send Now Playing: {exc}")
+
+    def _now_playing(self, snapshot):
+        if self.stopped.is_set():
+            return
+        # Coalesce pending snapshots while a slow control connection catches up.
+        try:
+            self.media_updates.get_nowait()
+        except queue.Empty:
+            pass
+        self.media_updates.put_nowait(snapshot)
+        if snapshot is None:
+            self.media_info.set_text("No MPRIS media source")
+            self.media_progress.set_fraction(0)
+            self.media_progress.set_text("No media source")
+            return
+        item = snapshot["media_item"]
+        self.media_info.set_text(
+            f"{snapshot['app_name']} · {snapshot['status']}\n"
+            f"{item['title'] or 'Untitled'}\n"
+            f"{item['artist'] or 'Unknown artist'} · {item['album_title'] or 'Unknown album'}\n"
+            f"Shuffle: {snapshot['shuffle_mode']} · Repeat: {snapshot['repeat_mode']}"
+        )
+        elapsed, duration = snapshot["elapsed_time"], item["playback_duration"]
+        self.media_progress.set_fraction(min(1, elapsed / duration) if duration else 0)
+
+        def timestamp(milliseconds):
+            seconds = milliseconds // 1000
+            return f"{seconds // 60}:{seconds % 60:02d}"
+
+        self.media_progress.set_text(f"{timestamp(elapsed)} / {timestamp(duration) if duration else '—'}")
+
     def _control(self):
         try:
             control = self._connect(self.args.port)
@@ -831,6 +897,7 @@ class Client:
                 raise ValueError("expected an init message from the provider")
             params = VideoParams.from_message(initial)
             control.settimeout(None)
+            threading.Thread(target=self._send_media, args=(control,), name="provider-media", daemon=True).start()
             GLib.idle_add(self._initialized, params, initial.get("input_devices", []))
             while not self.stopped.is_set():
                 message = recv_message(control)
@@ -863,6 +930,13 @@ class Client:
                 f"Provider: {params.width}×{params.height} · {params.fps} fps\n"
                 f"Encoder: H.264 · {self.args.bitrate} kbit/s target\nNo display stream requested"
             )
+            self.media = MprisBackend(self._now_playing, self.args.mpris_player)
+            try:
+                self.media.start()
+            except Exception as exc:
+                LOG.warning("MPRIS unavailable: %s", exc)
+                self.media.close()
+                self._now_playing(None)
             if self.args.test_source:
                 self.status.set_text("Test source ready; waiting for a display request…")
             else:
@@ -1061,6 +1135,8 @@ class Client:
         for sock in sockets:
             close_socket(sock)
         self._stop_stream()
+        if self.media:
+            self.media.close()
         if self.emulator:
             try:
                 self.emulator.release()
@@ -1090,6 +1166,7 @@ def main():
     parser.add_argument("--bitrate", type=int, default=4000, help="H.264 bitrate in kbit/s (default: 4000)")
     parser.add_argument("--timeout", type=float, default=10, help="connection/send timeout in seconds (default: 10)")
     parser.add_argument("--test-source", action="store_true", help="stream a test pattern instead of requesting a virtual monitor")
+    parser.add_argument("--mpris-player", help="MPRIS player name (for example vlc); default: prefer a playing app")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     if not 0 < args.port <= 65535 or not 0 < args.bitrate <= 2048000:

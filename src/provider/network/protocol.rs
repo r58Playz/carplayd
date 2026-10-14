@@ -1,11 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-use crate::carplay::input::{InputDevice, InputEvent};
+use crate::carplay::{
+	input::{InputDevice, InputEvent},
+	media::NowPlaying,
+};
 
 /// Control messages sent by carplayd, with an explicit top-level discriminator.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ProviderMessage {
+pub enum ProviderSentMessage {
 	/// Sent when first connecting to the control socket.
 	Init {
 		display_width: u32,
@@ -22,6 +25,12 @@ pub enum ProviderMessage {
 	},
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderReceivedMessage {
+	NowPlayingUpdate { now_playing: Option<NowPlaying> },
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -32,7 +41,7 @@ mod tests {
 	fn messages_have_flat_payloads_and_round_trip_with_explicit_types() {
 		let cases = [
 			(
-				ProviderMessage::Init {
+				ProviderSentMessage::Init {
 					display_width: 800,
 					display_height: 480,
 					display_fps: 30,
@@ -42,11 +51,11 @@ mod tests {
 					"display_fps": 30, "input_devices": ["IapRemote"]}),
 			),
 			(
-				ProviderMessage::DisplayRequest { port: 6768 },
+				ProviderSentMessage::DisplayRequest { port: 6768 },
 				json!({"type": "display_request", "port": 6768}),
 			),
 			(
-				ProviderMessage::InputEvent {
+				ProviderSentMessage::InputEvent {
 					device: InputDevice::IapRemote,
 					events: vec![InputEvent::Key {
 						key: InputKey::PlayPause,
@@ -59,7 +68,7 @@ mod tests {
 		];
 		for (message, expected) in cases {
 			assert_eq!(serde_json::to_value(&message).unwrap(), expected);
-			let decoded: ProviderMessage = serde_json::from_value(expected.clone()).unwrap();
+			let decoded: ProviderSentMessage = serde_json::from_value(expected.clone()).unwrap();
 			assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
 		}
 	}
@@ -70,7 +79,29 @@ mod tests {
 			json!({"port": 6768}),
 			json!({"type": "unknown", "port": 6768}),
 		] {
-			assert!(serde_json::from_value::<ProviderMessage>(message).is_err());
+			assert!(serde_json::from_value::<ProviderSentMessage>(message).is_err());
+		}
+	}
+
+	#[test]
+	fn now_playing_snapshots_and_missing_sources_round_trip() {
+		for now_playing in [
+			json!({"media_item": {"title": "Track", "artist": "Artist"},
+				"status": "Paused", "elapsed_time": 12000}),
+			serde_json::Value::Null,
+		] {
+			let expected = json!({"type": "now_playing_update", "now_playing": now_playing});
+			let message: ProviderReceivedMessage = serde_json::from_value(expected).unwrap();
+			let encoded = serde_json::to_value(message).unwrap();
+			assert_eq!(encoded["type"], "now_playing_update");
+			if now_playing.is_null() {
+				assert!(encoded["now_playing"].is_null());
+			} else {
+				assert_eq!(encoded["now_playing"]["media_item"]["title"], "Track");
+				assert_eq!(encoded["now_playing"]["status"], "Paused");
+				assert_eq!(encoded["now_playing"]["elapsed_time"], 12000);
+			}
+			serde_json::from_value::<ProviderReceivedMessage>(encoded).unwrap();
 		}
 	}
 }

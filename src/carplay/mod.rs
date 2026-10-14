@@ -24,6 +24,7 @@ pub mod ctrl_server;
 pub mod encoder;
 mod h264;
 pub mod input;
+pub mod media;
 pub mod modes;
 pub mod net;
 pub mod usb;

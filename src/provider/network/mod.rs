@@ -10,11 +10,11 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use futures::{SinkExt, StreamExt};
-use log::{info, warn};
+use log::info;
 use tokio::{
 	net::{TcpListener, TcpStream},
 	select,
-	sync::{mpsc, oneshot},
+	sync::{mpsc, oneshot, watch},
 };
 use tokio_util::{
 	codec::{Framed, FramedRead, LengthDelimitedCodec},
@@ -23,13 +23,17 @@ use tokio_util::{
 use v4l2r::ioctl::PlaneMapping;
 
 use crate::{
-	carplay::input::{InputDevice, InputReport},
+	carplay::{
+		input::{InputDevice, InputReport},
+		media::NowPlaying,
+	},
 	provider::{
-		CarplayProvider, CarplayProviderConnection, CarplayProviderScreen,
+		CarplayProvider, CarplayProviderConnection, CarplayProviderMedia, CarplayProviderScreen,
+		MediaEvent,
 		decoder::{
 			VideoDecoderConfig, VideoDecoderInput, VideoDecoderOutput, create_video_decoder,
 		},
-		network::protocol::ProviderMessage,
+		network::protocol::{ProviderReceivedMessage, ProviderSentMessage},
 	},
 	v4l2::VideoParams,
 };
@@ -39,8 +43,9 @@ mod protocol;
 const V4L2_DEVICE: &str = "/dev/video10";
 
 enum ProviderEvent {
-	Command(BytesMut),
+	ReceivedMessage(BytesMut),
 	GetScreen(oneshot::Sender<Result<CarplayDebugNetworkProviderScreen>>),
+	GetMedia(oneshot::Sender<CarplayDebugNetworkProviderMedia>),
 	ProcessInput(InputDevice, InputReport, oneshot::Sender<Result<()>>),
 }
 
@@ -70,11 +75,11 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 		video: VideoParams,
 		input: Vec<InputDevice>,
 	) -> Result<Self::Connection> {
-		let (tx, rx) = mpsc::unbounded_channel();
+		let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
 
 		self.video.replace(video);
 		self.input.replace(input);
-		self.ctrl.replace(rx);
+		self.ctrl.replace(ctrl_rx);
 
 		let listener = TcpListener::bind(SocketAddr::new(
 			IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -98,7 +103,7 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 				.new_framed(stream),
 		);
 
-		Ok(CarplayDebugNetworkProviderConnection(tx))
+		Ok(CarplayDebugNetworkProviderConnection(ctrl_tx))
 	}
 
 	async fn run(mut self) -> Result<()> {
@@ -107,9 +112,11 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 		let mut stream = self.stream.take().unwrap();
 		let mut ctrl = self.ctrl.take().unwrap();
 
+		let (now_playing_tx, now_playing_rx) = watch::channel(None);
+
 		stream
 			.send(
-				serde_json::to_vec(&ProviderMessage::Init {
+				serde_json::to_vec(&ProviderSentMessage::Init {
 					display_width: video_params.width,
 					display_height: video_params.height,
 					display_fps: video_params.fps,
@@ -123,14 +130,22 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 
 		loop {
 			let Some(ev) = select!(
-				command = stream.next() => command.transpose().context("failed to read from stream")?.map(ProviderEvent::Command),
+				command = stream.next() => command.transpose().context("failed to read from stream")?.map(ProviderEvent::ReceivedMessage),
 				event = ctrl.recv() => event
 			) else {
 				break Ok(());
 			};
 			match ev {
-				ProviderEvent::Command(x) => {
-					warn!("provider sent something {x:?}");
+				ProviderEvent::ReceivedMessage(x) => {
+					let parsed = serde_json::from_slice::<ProviderReceivedMessage>(&x)
+						.context("failed to read provider recvd message")?;
+					match parsed {
+						ProviderReceivedMessage::NowPlayingUpdate { now_playing } => {
+							now_playing_tx
+								.send(now_playing)
+								.context("failed to send now_playing")?;
+						}
+					}
 				}
 				ProviderEvent::GetScreen(tx) => {
 					let _ = tx.send(
@@ -149,9 +164,11 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 							info!("waiting for display stream connection on 0.0.0.0:{port}");
 							stream
 								.send(
-									serde_json::to_vec(&ProviderMessage::DisplayRequest { port })
-										.context("failed to serialize")?
-										.into(),
+									serde_json::to_vec(&ProviderSentMessage::DisplayRequest {
+										port,
+									})
+									.context("failed to serialize")?
+									.into(),
 								)
 								.await
 								.context("failed to send request message")?;
@@ -181,12 +198,17 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 						.await,
 					);
 				}
+				ProviderEvent::GetMedia(tx) => {
+					let _ = tx.send(CarplayDebugNetworkProviderMedia {
+						now_playing_rx: now_playing_rx.clone(),
+					});
+				}
 				ProviderEvent::ProcessInput(device, report, tx) => {
 					let _ = tx.send(
 						async {
 							stream
 								.send(
-									serde_json::to_vec(&ProviderMessage::InputEvent {
+									serde_json::to_vec(&ProviderSentMessage::InputEvent {
 										device,
 										events: report.events,
 									})
@@ -206,9 +228,17 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 }
 
 pub struct CarplayDebugNetworkProviderConnection(mpsc::UnboundedSender<ProviderEvent>);
-#[async_trait]
 impl CarplayProviderConnection for CarplayDebugNetworkProviderConnection {
 	type Screen = CarplayDebugNetworkProviderScreen;
+	type Media = CarplayDebugNetworkProviderMedia;
+
+	async fn get_media(&mut self) -> Result<Self::Media> {
+		let (tx, rx) = oneshot::channel();
+		self.0
+			.send(ProviderEvent::GetMedia(tx))
+			.context("failed to send media request")?;
+		rx.await.context("failed to wait for media")
+	}
 
 	async fn get_screen(&mut self) -> Result<Self::Screen> {
 		let (tx, rx) = oneshot::channel();
@@ -365,6 +395,26 @@ impl CarplayProviderScreen for CarplayDebugNetworkProviderScreen {
 				Ok(timestamp)
 			}))
 			.await
+	}
+}
+
+pub struct CarplayDebugNetworkProviderMedia {
+	now_playing_rx: watch::Receiver<Option<NowPlaying>>,
+}
+#[async_trait]
+impl CarplayProviderMedia for CarplayDebugNetworkProviderMedia {
+	async fn next_now_playing_change(&mut self) -> Result<MediaEvent> {
+		self.now_playing_rx
+			.changed()
+			.await
+			.context("failed to wait for now_playing change")?;
+		Ok(MediaEvent::NowPlayingChanged(
+			self.now_playing_rx.borrow_and_update().clone(),
+		))
+	}
+
+	fn get_now_playing(&mut self) -> Result<Option<NowPlaying>> {
+		Ok(self.now_playing_rx.borrow_and_update().clone())
 	}
 }
 
