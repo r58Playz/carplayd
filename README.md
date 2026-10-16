@@ -1,20 +1,18 @@
 # carplayd
 
-iPhone-side CarPlay implementation and bridge to Android Auto (wip) targetting RPi Zero 2 W
+iPhone-side wired CarPlay implementation with pluggable video/audio/input providers targetting just a RPi Zero 2 W (no MFi chip needed)
 
-## cross-compiling and copying to the Pi
+**This implements the iPhone side, meaning it streams video/audio/input to a head unit that it connects to.** It does not present a head unit to an iPhone. This allows forwarding of Android Auto or other custom UI.
 
-Run `./build-pi.sh` to build a release binary for `aarch64-unknown-linux-gnu` and
-copy it to `user@pi-carplayd.lan:~`. Use `./build-pi.sh --build-only` to skip the
-copy, or pass another destination: `./build-pi.sh user@another-pi:~`.
+## How It Works
+- the iPhone authenticates the head unit for MFi, so we can always accept whatever the head unit gives us
+- handshake requires starting off as a USB gadget then role switching to USB host
+    - /dev/mem is used to poke at the USB chip since regular roleswitch is broken
+- carplayd handles video encode and input translation
+    - providers written with a set of Rust traits
+    - debug provider exposes carplayd over network
 
-The script uses `aarch64-linux-gnu-gcc` and its sysroot, selecting the target's
-Linux headers for `v4l2r` binding generation. Host libclang is required for
-bindgen; no target libclang or libv4l2 library is needed. For another AArch64 glibc
-toolchain, including Buildroot, set `CARPLAYD_LINKER` to its compiler executable.
-Set `CARPLAYD_SYSROOT` if you need to override the compiler's reported sysroot.
-
-## running
+## Running
 1. compile
 2. install 80-carplay-ncm.rules if using NetworkManager
 3. create a config folder and put a file serial_number in with the serial you want to expose
