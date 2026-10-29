@@ -1,5 +1,6 @@
 //! vibecoded
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use v4l2r::ioctl::PlaneMapping;
 
 use crate::v4l2::VideoParams;
@@ -41,7 +42,7 @@ impl Yuv420Layout {
 }
 
 /// Coordinates in pixels. All fields must be even for a YUV 4:2:0 view.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FrameCrop {
 	pub left: u32,
 	pub top: u32,

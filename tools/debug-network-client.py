@@ -348,6 +348,38 @@ class VideoParams:
         return params
 
 
+def source_geometry(params, source_size, safe_area):
+    """Validate the wire crop and source independently of desktop/GStreamer state."""
+    width, height = source_size or (params.width, params.height)
+    positive_integer(width, "source width", 8192)
+    positive_integer(height, "source height", 8192)
+    if width % 2 or height % 2:
+        raise ValueError("source dimensions must be even")
+    crop = None
+    if safe_area is not None:
+        left, top, crop_width, crop_height = safe_area
+        if any(type(n) is not int or n < 0 or n % 2 for n in safe_area):
+            raise ValueError("safe-area coordinates and dimensions must be nonnegative and even")
+        if (crop_width, crop_height) != (params.width, params.height):
+            raise ValueError("safe-area dimensions must exactly match the provider display")
+        if left + crop_width > width or top + crop_height > height:
+            raise ValueError("safe area exceeds source dimensions")
+        crop = dict(left=left, top=top, width=crop_width, height=crop_height)
+    elif (width, height) != (params.width, params.height):
+        raise ValueError("a different source size requires --safe-area")
+    return VideoParams(width, height, params.fps), crop
+
+
+def geometry_argument(value, separator, count):
+    try:
+        parts = tuple(int(n) for n in value.split(separator))
+        if len(parts) != count:
+            raise ValueError()
+        return parts
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected {count} integers separated by {separator!r}")
+
+
 def send_access_unit(sock, pts_us, data):
     length = 8 + len(data)
     if not data or len(data) > MAX_ACCESS_UNIT:
@@ -560,8 +592,9 @@ class ScreenCastPortal:
 class MediaStream:
     """Encode AUs, send each AU, then decode those same bytes for the preview."""
 
-    def __init__(self, sock, params, bitrate, on_error, fd=None):
+    def __init__(self, sock, params, bitrate, on_error, fd=None, safe_area=None):
         self.socket = sock
+        self.safe_area = safe_area
         self.params = params
         self.bitrate = bitrate
         self.on_error = on_error
@@ -585,6 +618,14 @@ class MediaStream:
         self.preview_source = self.preview.get_by_name("encoded")
         self.preview_sink = self.preview.get_by_name("preview")
         source = "videotestsrc is-live=true pattern=ball" if test_source else "pipewiresrc name=screen"
+        if test_source and self.safe_area:
+            # Encode a bright green frame around the retained region. Those
+            # pixels must disappear only when carplayd crops the decoded frame.
+            c, p = self.safe_area, self.params
+            source += (f" ! video/x-raw,width={c['width']},height={c['height']} "
+                       f"! videobox left={-c['left']} top={-c['top']} "
+                       f"right={-(p.width-c['left']-c['width'])} "
+                       f"bottom={-(p.height-c['top']-c['height'])} fill=green")
         p = self.params
         # KDE's virtual output follows the negotiated PipeWire size. Constrain
         # the source before conversion so the desktop itself matches CarPlay.
@@ -700,6 +741,7 @@ class Client:
         self.emulator = None
         self.media = None
         self.media_updates = queue.Queue(maxsize=1)
+        self.control_updates = queue.Queue(maxsize=64)
         self.source_ready = args.test_source
         self.stopped = threading.Event()
         self.sockets = set()
@@ -851,13 +893,25 @@ class Client:
         try:
             while not self.stopped.is_set():
                 try:
-                    snapshot = self.media_updates.get(timeout=0.5)
+                    message = self.control_updates.get(timeout=0.1)
                 except queue.Empty:
-                    continue
-                send_message(control, {"type": "now_playing_update", "now_playing": snapshot})
+                    message = None
+                if message is not None:
+                    if isinstance(message, tuple):
+                        payload, sent = message
+                        send_message(control, payload)
+                        sent.set()
+                    else:
+                        send_message(control, message)
+                try:
+                    snapshot = self.media_updates.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    send_message(control, {"type": "now_playing_update", "now_playing": snapshot})
         except Exception as exc:
             if not self.stopped.is_set():
-                GLib.idle_add(self.fail, f"could not send Now Playing: {exc}")
+                GLib.idle_add(self.fail, f"could not send provider control: {exc}")
 
     def _now_playing(self, snapshot):
         if self.stopped.is_set():
@@ -896,6 +950,8 @@ class Client:
             if message_type(initial) != "init":
                 raise ValueError("expected an init message from the provider")
             params = VideoParams.from_message(initial)
+            source_params, safe_area = source_geometry(params, self.args.source_size, self.args.safe_area)
+            self.source_params, self.safe_area = source_params, safe_area
             control.settimeout(None)
             threading.Thread(target=self._send_media, args=(control,), name="provider-media", daemon=True).start()
             GLib.idle_add(self._initialized, params, initial.get("input_devices", []))
@@ -904,7 +960,12 @@ class Client:
                 kind = message_type(message)
                 if kind == "display_request":
                     port = positive_integer(message.get("port"), "display port", 65535)
-                    # Connect immediately so the provider can complete get_screen().
+                    # Serialize through the existing writer to avoid interleaving
+                    # control frames with audio/metadata from other threads.
+                    sent = threading.Event()
+                    self.control_updates.put(({"type": "display_response", "safe_area": self.safe_area}, sent), timeout=self.args.timeout)
+                    if not sent.wait(self.args.timeout):
+                        raise TimeoutError("timed out sending display response")
                     display = self._connect(port)
                     GLib.idle_add(self._display_requested, display)
                 elif kind == "input_event":
@@ -983,7 +1044,8 @@ class Client:
             self._stop_stream()
             fd = None if self.args.test_source else self.portal.open_remote()
             self.stream = MediaStream(
-                self.pending_socket, self.params, self.args.bitrate, self._stream_error, fd,
+                self.pending_socket, self.source_params, self.args.bitrate, self._stream_error, fd,
+                safe_area=self.safe_area,
             )
             self.pending_socket = None
             self.pixbuf = None
@@ -1166,9 +1228,15 @@ def main():
     parser.add_argument("--bitrate", type=int, default=4000, help="H.264 bitrate in kbit/s (default: 4000)")
     parser.add_argument("--timeout", type=float, default=10, help="connection/send timeout in seconds (default: 10)")
     parser.add_argument("--test-source", action="store_true", help="stream a test pattern instead of requesting a virtual monitor")
+    parser.add_argument("--source-size", type=lambda value: geometry_argument(value, "x", 2),
+                        help="encoded test source size WIDTHxHEIGHT")
+    parser.add_argument("--safe-area", type=lambda value: geometry_argument(value, ",", 4),
+                        help="daemon-side test crop LEFT,TOP,WIDTH,HEIGHT")
     parser.add_argument("--mpris-player", help="MPRIS player name (for example vlc); default: prefer a playing app")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if (args.source_size or args.safe_area) and not args.test_source:
+        parser.error("--source-size and --safe-area require --test-source")
     if not 0 < args.port <= 65535 or not 0 < args.bitrate <= 2048000:
         parser.error("port must be 1–65535 and bitrate must be 1–2048000 kbit/s")
     if not math.isfinite(args.timeout) or args.timeout <= 0:

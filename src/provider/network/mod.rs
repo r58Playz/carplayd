@@ -6,7 +6,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -33,6 +33,7 @@ use crate::{
 		decoder::{
 			VideoDecoderConfig, VideoDecoderInput, VideoDecoderOutput, create_video_decoder,
 		},
+		frame::FrameCrop,
 		network::protocol::{ProviderReceivedMessage, ProviderSentMessage},
 	},
 	v4l2::VideoParams,
@@ -47,6 +48,98 @@ enum ProviderEvent {
 	GetScreen(oneshot::Sender<Result<CarplayDebugNetworkProviderScreen>>),
 	GetMedia(oneshot::Sender<CarplayDebugNetworkProviderMedia>),
 	ProcessInput(InputDevice, InputReport, oneshot::Sender<Result<()>>),
+}
+
+/// One response and one TCP connection complete a display request. The task
+/// never reads control; the main loop keeps dispatching input and metadata.
+struct PendingDisplay {
+	response: Option<oneshot::Sender<Option<FrameCrop>>>,
+	reply: oneshot::Sender<Result<CarplayDebugNetworkProviderScreen>>,
+	task: AbortOnDropHandle<Result<(TcpStream, Option<FrameCrop>)>>,
+}
+
+impl PendingDisplay {
+	async fn new(
+		reply: oneshot::Sender<Result<CarplayDebugNetworkProviderScreen>>,
+		peer: IpAddr,
+		deadline: Duration,
+	) -> Result<(u16, Self)> {
+		let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+		let port = listener.local_addr()?.port();
+		let (tx, rx) = oneshot::channel();
+		let task = AbortOnDropHandle::new(tokio::spawn(async move {
+			tokio::time::timeout(deadline, async move {
+				let crop = rx.await.context("display response cancelled")?;
+				let (socket, addr) = listener.accept().await?;
+				ensure!(
+					addr.ip() == peer,
+					"display connection peer does not match control peer"
+				);
+				socket.set_nodelay(true)?;
+				Ok((socket, crop))
+			})
+			.await
+			.context("display response/connection timed out")?
+		}));
+		Ok((
+			port,
+			Self {
+				response: Some(tx),
+				reply,
+				task,
+			},
+		))
+	}
+
+	fn respond(&mut self, crop: Option<FrameCrop>, params: VideoParams) -> Result<()> {
+		ensure!(self.response.is_some(), "duplicate display response");
+		if let Some(crop) = crop {
+			// Bounds against the decoded visible image are checked by image.crop().
+			crop.validate(u32::MAX, u32::MAX)?;
+			ensure!(
+				crop.width == params.width && crop.height == params.height,
+				"safe area must exactly match display {}x{}",
+				params.width,
+				params.height
+			);
+		}
+		self.response
+			.take()
+			.unwrap()
+			.send(crop)
+			.map_err(|_| anyhow::anyhow!("display request already ended"))
+	}
+
+	async fn poll(pending: &mut Option<Self>) -> Option<Result<(TcpStream, Option<FrameCrop>)>> {
+		let Some(pending) = pending else {
+			return std::future::pending().await;
+		};
+		select! {
+			_ = pending.reply.closed() => None,
+			result = &mut pending.task => Some(result.context("display connection task failed").and_then(|x| x)),
+		}
+	}
+}
+
+fn connected_screen(
+	socket: TcpStream,
+	params: VideoParams,
+	safe_area: Option<FrameCrop>,
+) -> Result<CarplayDebugNetworkProviderScreen> {
+	let (input, output) =
+		create_video_decoder(Path::new(V4L2_DEVICE), VideoDecoderConfig::default())
+			.context("failed to create video decoder")?;
+	Ok(CarplayDebugNetworkProviderScreen {
+		params,
+		safe_area,
+		input: DecoderInputTask::new(
+			LengthDelimitedCodec::builder()
+				.little_endian()
+				.new_read(socket),
+			input,
+		),
+		output,
+	})
 }
 
 pub struct CarplayDebugNetworkProvider {
@@ -111,6 +204,8 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 		let input_devices = self.input.take().unwrap();
 		let mut stream = self.stream.take().unwrap();
 		let mut ctrl = self.ctrl.take().unwrap();
+		let peer = stream.get_ref().peer_addr()?.ip();
+		let mut pending_display = None;
 
 		let (now_playing_tx, now_playing_rx) = watch::channel(None);
 
@@ -131,7 +226,14 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 		loop {
 			let Some(ev) = select!(
 				command = stream.next() => command.transpose().context("failed to read from stream")?.map(ProviderEvent::ReceivedMessage),
-				event = ctrl.recv() => event
+				event = ctrl.recv() => event,
+				result = PendingDisplay::poll(&mut pending_display) => {
+					let pending = pending_display.take().unwrap();
+					if let Some(result) = result {
+						let _ = pending.reply.send(result.and_then(|(socket, crop)| connected_screen(socket, video_params, crop)));
+					}
+					continue;
+				}
 			) else {
 				break Ok(());
 			};
@@ -140,6 +242,12 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 					let parsed = serde_json::from_slice::<ProviderReceivedMessage>(&x)
 						.context("failed to read provider recvd message")?;
 					match parsed {
+						ProviderReceivedMessage::DisplayResponse { safe_area } => {
+							pending_display
+								.as_mut()
+								.context("unsolicited display response")?
+								.respond(safe_area, video_params)?;
+						}
 						ProviderReceivedMessage::NowPlayingUpdate { now_playing } => {
 							now_playing_tx
 								.send(now_playing)
@@ -148,55 +256,19 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 					}
 				}
 				ProviderEvent::GetScreen(tx) => {
-					let _ = tx.send(
-						async {
-							let listener = TcpListener::bind(SocketAddr::new(
-								IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-								0,
-							))
-							.await
-							.context("failed to bind to a port")?;
-							let port = listener
-								.local_addr()
-								.context("failed to get local addr")?
-								.port();
-
-							info!("waiting for display stream connection on 0.0.0.0:{port}");
-							stream
-								.send(
-									serde_json::to_vec(&ProviderSentMessage::DisplayRequest {
-										port,
-									})
-									.context("failed to serialize")?
-									.into(),
-								)
-								.await
-								.context("failed to send request message")?;
-							let (stream, addr) = listener
-								.accept()
-								.await
-								.context("failed to accept screen stream")?;
-							info!("display stream accepted from {addr:?}");
-
-							let (input, output) = create_video_decoder(
-								Path::new(V4L2_DEVICE),
-								VideoDecoderConfig::default(),
-							)
-							.context("failed to create video decoder")?;
-
-							Ok(CarplayDebugNetworkProviderScreen {
-								params: video_params,
-								input: DecoderInputTask::new(
-									LengthDelimitedCodec::builder()
-										.little_endian()
-										.new_read(stream),
-									input,
-								),
-								output,
-							})
-						}
-						.await,
-					);
+					if pending_display.is_some() {
+						let _ = tx.send(Err(anyhow::anyhow!("display request already pending")));
+						continue;
+					}
+					let (port, pending) =
+						PendingDisplay::new(tx, peer, Duration::from_secs(10)).await?;
+					pending_display = Some(pending);
+					stream
+						.send(
+							serde_json::to_vec(&ProviderSentMessage::DisplayRequest { port })?
+								.into(),
+						)
+						.await?;
 				}
 				ProviderEvent::GetMedia(tx) => {
 					let _ = tx.send(CarplayDebugNetworkProviderMedia {
@@ -379,6 +451,7 @@ impl DecoderInputTask {
 
 pub struct CarplayDebugNetworkProviderScreen {
 	params: VideoParams,
+	safe_area: Option<FrameCrop>,
 	input: DecoderInputTask,
 	output: VideoDecoderOutput,
 }
@@ -389,7 +462,11 @@ impl CarplayProviderScreen for CarplayDebugNetworkProviderScreen {
 		self.input
 			.next_frame(self.output.next_frame(|x| {
 				let timestamp = x.timestamp.unwrap_or_else(Instant::now);
-				x.image
+				let image = match self.safe_area {
+					Some(crop) => x.image.crop(crop).context("invalid display safe area")?,
+					None => x.image,
+				};
+				image
 					.copy_to(buffer, self.params)
 					.context("failed to copy")?;
 				Ok(timestamp)
@@ -422,6 +499,163 @@ impl CarplayProviderMedia for CarplayDebugNetworkProviderMedia {
 mod tests {
 	use super::*;
 	use tokio::time::timeout;
+
+	fn test_params() -> VideoParams {
+		VideoParams {
+			width: 1080,
+			height: 678,
+			fps: 30,
+			bytes_per_line: 1088,
+			buffer_height: 688,
+		}
+	}
+
+	#[tokio::test]
+	async fn display_handshake_validates_crop_before_accepting_and_rejects_duplicates() {
+		let (tx, _rx) = oneshot::channel();
+		let (port, mut pending) =
+			PendingDisplay::new(tx, Ipv4Addr::LOCALHOST.into(), Duration::from_secs(1))
+				.await
+				.unwrap();
+		let crop = FrameCrop {
+			left: 100,
+			top: 20,
+			width: 1080,
+			height: 678,
+		};
+		for bad in [
+			FrameCrop { left: 1, ..crop },
+			FrameCrop { width: 800, ..crop },
+			FrameCrop { height: 0, ..crop },
+			FrameCrop {
+				left: u32::MAX - 1,
+				..crop
+			},
+		] {
+			assert!(pending.respond(Some(bad), test_params()).is_err());
+		}
+		// TCP can enter the backlog before the control response is processed,
+		// but must not complete the handshake by itself.
+		let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+			.await
+			.unwrap();
+		assert!(
+			tokio::time::timeout(Duration::from_millis(10), &mut pending.task)
+				.await
+				.is_err()
+		);
+		pending.respond(Some(crop), test_params()).unwrap();
+		assert!(pending.respond(None, test_params()).is_err());
+		let (_, mut received) = (&mut pending.task).await.unwrap().unwrap();
+		assert_eq!(received.take().unwrap(), crop);
+	}
+
+	#[tokio::test]
+	async fn display_handshake_times_out_in_either_stage_and_cancels() {
+		for respond in [false, true] {
+			let (tx, _rx) = oneshot::channel();
+			let (_, mut pending) =
+				PendingDisplay::new(tx, Ipv4Addr::LOCALHOST.into(), Duration::from_millis(15))
+					.await
+					.unwrap();
+			if respond {
+				pending.respond(None, test_params()).unwrap();
+			}
+			let error = (&mut pending.task).await.unwrap().unwrap_err();
+			assert!(error.to_string().contains("timed out"));
+		}
+		let (tx, rx) = oneshot::channel();
+		let (port, pending) =
+			PendingDisplay::new(tx, Ipv4Addr::LOCALHOST.into(), Duration::from_secs(1))
+				.await
+				.unwrap();
+		let mut pending = Some(pending);
+		drop(rx);
+		assert!(PendingDisplay::poll(&mut pending).await.is_none());
+		drop(pending);
+		tokio::task::yield_now().await;
+		assert!(
+			TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+				.await
+				.is_err()
+		);
+	}
+
+	#[tokio::test]
+	async fn control_dispatches_metadata_during_both_display_stages() {
+		let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+		let client = TcpStream::connect(listener.local_addr().unwrap())
+			.await
+			.unwrap();
+		let (socket, _) = listener.accept().await.unwrap();
+		let (tx, rx) = mpsc::unbounded_channel();
+		let provider = CarplayDebugNetworkProvider {
+			port: 0,
+			stream: Some(
+				LengthDelimitedCodec::builder()
+					.little_endian()
+					.new_framed(socket),
+			),
+			video: Some(test_params()),
+			input: Some(vec![]),
+			ctrl: Some(rx),
+		};
+		let running = tokio::spawn(provider.run());
+		let mut client = LengthDelimitedCodec::builder()
+			.little_endian()
+			.new_framed(client);
+		let init = client.next().await.unwrap().unwrap();
+		assert!(matches!(
+			serde_json::from_slice::<ProviderSentMessage>(&init).unwrap(),
+			ProviderSentMessage::Init { .. }
+		));
+		let (screen_tx, screen_rx) = oneshot::channel();
+		tx.send(ProviderEvent::GetScreen(screen_tx)).unwrap();
+		let request = client.next().await.unwrap().unwrap();
+		assert!(matches!(
+			serde_json::from_slice::<ProviderSentMessage>(&request).unwrap(),
+			ProviderSentMessage::DisplayRequest { .. }
+		));
+		let (media_tx, media_rx) = oneshot::channel();
+		tx.send(ProviderEvent::GetMedia(media_tx)).unwrap();
+		let mut media = tokio::time::timeout(Duration::from_secs(1), media_rx)
+			.await
+			.unwrap()
+			.unwrap();
+		for response_sent in [false, true] {
+			if response_sent {
+				client
+					.send(
+						serde_json::to_vec(&ProviderReceivedMessage::DisplayResponse {
+							safe_area: None,
+						})
+						.unwrap()
+						.into(),
+					)
+					.await
+					.unwrap();
+			}
+			client
+				.send(
+					br#"{"type":"now_playing_update","now_playing":null}"#
+						.as_slice()
+						.into(),
+				)
+				.await
+				.unwrap();
+			tokio::time::timeout(Duration::from_secs(1), media.next_now_playing_change())
+				.await
+				.unwrap()
+				.unwrap();
+		}
+		drop(client);
+		tokio::time::timeout(Duration::from_secs(1), running)
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert!(screen_rx.await.is_err());
+	}
 
 	#[test]
 	fn first_pts_anchors_the_clock_and_later_arrival_jitter_is_ignored() {

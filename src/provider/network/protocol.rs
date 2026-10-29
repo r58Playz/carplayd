@@ -1,3 +1,4 @@
+use crate::provider::frame::FrameCrop;
 use serde::{Deserialize, Serialize};
 
 use crate::carplay::{
@@ -16,7 +17,7 @@ pub enum ProviderSentMessage {
 		display_fps: u32,
 		input_devices: Vec<InputDevice>,
 	},
-	/// Request a screen stream; the client responds by connecting to this port.
+	/// The client sends DisplayResponse on control, then connects to this port.
 	DisplayRequest { port: u16 },
 	/// Forward input; no response is needed.
 	InputEvent {
@@ -28,7 +29,14 @@ pub enum ProviderSentMessage {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderReceivedMessage {
-	NowPlayingUpdate { now_playing: Option<NowPlaying> },
+	DisplayResponse {
+		// Required even when null: the response is the display handshake.
+		#[serde(deserialize_with = "Option::deserialize")]
+		safe_area: Option<FrameCrop>,
+	},
+	NowPlayingUpdate {
+		now_playing: Option<NowPlaying>,
+	},
 }
 
 #[cfg(test)]
@@ -36,6 +44,24 @@ mod tests {
 	use super::*;
 	use crate::carplay::input::InputKey;
 	use serde_json::json;
+
+	#[test]
+	fn display_response_requires_an_explicit_nullable_crop() {
+		for crop in [
+			serde_json::Value::Null,
+			json!({"left": 100, "top": 20, "width": 1080, "height": 678}),
+		] {
+			let value = json!({"type": "display_response", "safe_area": crop});
+			let decoded: ProviderReceivedMessage = serde_json::from_value(value.clone()).unwrap();
+			assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+		}
+		for value in [
+			json!({"type": "display_response"}),
+			json!({"type": "display_response", "safe_area": {"left": -2}}),
+		] {
+			assert!(serde_json::from_value::<ProviderReceivedMessage>(value).is_err());
+		}
+	}
 
 	#[test]
 	fn messages_have_flat_payloads_and_round_trip_with_explicit_types() {
