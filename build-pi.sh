@@ -19,7 +19,7 @@ if (( $# > 1 )) || [[ ${1:-} == -* ]]; then
     exit 2
 fi
 
-default_destination='user@pi-carplayd.lan:~'
+default_destination='user@10.42.0.1:~'
 destination=${1:-${CARPLAYD_DESTINATION:-$default_destination}}
 target=aarch64-unknown-linux-gnu
 compiler=${CARPLAYD_LINKER:-aarch64-linux-gnu-gcc}

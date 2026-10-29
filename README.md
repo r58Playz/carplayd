@@ -17,3 +17,14 @@ iPhone-side wired CarPlay implementation with pluggable video/audio/input provid
 2. install 80-carplay-ncm.rules if using NetworkManager
 3. create a config folder and put a file serial_number in with the serial you want to expose
 4. run, passing path to the config folder
+
+## Debug Android Auto bridge
+
+There is an initial testing version of the Android Auto bridge using the network debug provider in `tools/aa-debug-bridge`.
+
+The [desktop Android Auto bridge](tools/aa-debug-bridge/README.md) uses
+[opencardev/aasdk](https://github.com/opencardev/aasdk), OpenCarDev's fork of the
+original [f1xpl/aasdk](https://github.com/f1xpl/aasdk) by Michal Szwaj (f1x.studio).
+The bridge was built and tested against branch `newdev` at commit
+[`9bf6adf933665dee26532201719fac14a047ccf1`](https://github.com/opencardev/aasdk/commit/9bf6adf933665dee26532201719fac14a047ccf1)
+(2026-06-11). See the bridge README for dependency checkout and build instructions.

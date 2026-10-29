@@ -1,2 +1,6 @@
 /target
 __pycache__/
+
+# Local CMake builds under tools.
+/tools/**/build*/
+/tools/**/*-build*/
