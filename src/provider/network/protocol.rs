@@ -1,4 +1,7 @@
-use crate::provider::frame::FrameCrop;
+use crate::provider::{
+	audio::{AudioRequest, AudioSpeech, AudioStatus},
+	frame::FrameCrop,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::carplay::{
@@ -16,9 +19,20 @@ pub enum ProviderSentMessage {
 		display_height: u32,
 		display_fps: u32,
 		input_devices: Vec<InputDevice>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		audio: Option<AudioCapabilities>,
 	},
 	/// The client sends DisplayResponse on control, then connects to this port.
-	DisplayRequest { port: u16 },
+	DisplayRequest {
+		port: u16,
+	},
+	AudioRequest {
+		id: u64,
+		port: u16,
+	},
+	AudioStatus {
+		status: AudioStatus,
+	},
 	/// Forward input; no response is needed.
 	InputEvent {
 		device: InputDevice,
@@ -37,6 +51,54 @@ pub enum ProviderReceivedMessage {
 	NowPlayingUpdate {
 		now_playing: Option<NowPlaying>,
 	},
+	AudioStart {
+		request: AudioRequest,
+	},
+	AudioStop {
+		id: u64,
+	},
+	AudioFlush {
+		id: u64,
+	},
+	AudioDuck {
+		id: u64,
+		duration_ms: u32,
+		volume: f64,
+	},
+	AudioUnduck {
+		id: u64,
+		duration_ms: u32,
+	},
+	AudioAppState {
+		speech: AudioSpeech,
+		phone_call: bool,
+		turn_by_turn: bool,
+	},
+	AudioInputProgress {
+		id: u64,
+		consumed: u64,
+	},
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AudioCapabilities {
+	pub sample_types: [crate::provider::audio::SampleType; 2],
+	pub min_sample_rate: u32,
+	pub max_sample_rate: u32,
+	pub max_channels: u8,
+}
+impl Default for AudioCapabilities {
+	fn default() -> Self {
+		Self {
+			sample_types: [
+				crate::provider::audio::SampleType::S16Le,
+				crate::provider::audio::SampleType::F32Le,
+			],
+			min_sample_rate: 8000,
+			max_sample_rate: 96000,
+			max_channels: 2,
+		}
+	}
 }
 
 #[cfg(test)]
@@ -72,6 +134,7 @@ mod tests {
 					display_height: 480,
 					display_fps: 30,
 					input_devices: vec![InputDevice::IapRemote],
+					audio: None,
 				},
 				json!({"type": "init", "display_width": 800, "display_height": 480,
 					"display_fps": 30, "input_devices": ["IapRemote"]}),

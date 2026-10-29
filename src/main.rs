@@ -102,6 +102,9 @@ async fn main() -> Result<()> {
 		.format_timestamp_millis()
 		.parse_default_env()
 		.init();
+	if std::env::args().nth(1).as_deref() == Some("--audio-benchmark") {
+		return provider::resampler::benchmark();
+	}
 
 	let dir = PathBuf::from(std::env::args().nth(1).context("no config dir provided")?);
 

@@ -50,8 +50,8 @@ export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu="$clang_args --target=
 echo "Building $target with V4L2 headers from $include_dir/linux"
 cargo build --release --locked --target "$target"
 
+binary=${CARGO_TARGET_DIR:-target}/$target/release/carplayd
 if [[ $build_only == false ]]; then
-    binary=${CARGO_TARGET_DIR:-target}/$target/release/carplayd
     echo "Copying $binary to $destination"
     scp -o ConnectTimeout=10 -- "$binary" "$destination"
 fi

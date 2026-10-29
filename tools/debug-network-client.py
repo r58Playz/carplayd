@@ -17,6 +17,7 @@ import time
 import uuid
 
 from mpris import MprisBackend
+from debug_audio import AudioController, PcmFormat
 
 
 LOG = logging.getLogger("debug-network-client")
@@ -87,7 +88,7 @@ def positive_integer(value, name, maximum):
 
 def message_type(message):
     kind = message.get("type")
-    if kind not in ("init", "display_request", "input_event"):
+    if kind not in ("init", "display_request", "input_event", "audio_request", "audio_status"):
         raise ValueError(f"unknown provider message type: {kind!r}")
     return kind
 
@@ -777,6 +778,8 @@ class Client:
         media_box.pack_start(self.media_progress, False, False, 0)
         media_frame.add(media_box)
         screen_box.pack_start(media_frame, False, False, 0)
+        self.audio = AudioController(args, Gst, Gtk, GLib, self._queue_control, self._connect, self._release)
+        screen_box.pack_start(self.audio.frame, False, False, 0)
         screen_frame.add(screen_box)
         sections.pack_start(screen_frame, True, True, 0)
 
@@ -913,6 +916,14 @@ class Client:
             if not self.stopped.is_set():
                 GLib.idle_add(self.fail, f"could not send provider control: {exc}")
 
+    def _queue_control(self, message):
+        if self.stopped.is_set():
+            return
+        try:
+            self.control_updates.put_nowait(message)
+        except queue.Full:
+            raise RuntimeError("provider control queue is full")
+
     def _now_playing(self, snapshot):
         if self.stopped.is_set():
             return
@@ -954,6 +965,7 @@ class Client:
             self.source_params, self.safe_area = source_params, safe_area
             control.settimeout(None)
             threading.Thread(target=self._send_media, args=(control,), name="provider-media", daemon=True).start()
+            GLib.idle_add(self.audio.capabilities, initial.get("audio"))
             GLib.idle_add(self._initialized, params, initial.get("input_devices", []))
             while not self.stopped.is_set():
                 message = recv_message(control)
@@ -970,6 +982,12 @@ class Client:
                     GLib.idle_add(self._display_requested, display)
                 elif kind == "input_event":
                     GLib.idle_add(self._input_received, message)
+                elif kind == "audio_request":
+                    identity = positive_integer(message.get("id"), "audio ID", (1 << 64) - 1)
+                    port = positive_integer(message.get("port"), "audio port", 65535)
+                    self.audio.requested(identity, port)
+                elif kind == "audio_status":
+                    GLib.idle_add(self.audio.status, message["status"])
                 else:
                     raise ValueError("unexpected second init message")
         except Exception as exc:
@@ -1192,6 +1210,7 @@ class Client:
         if self.stopped.is_set():
             return False
         self.stopped.set()
+        self.audio.close()
         with self.socket_lock:
             sockets, self.sockets = self.sockets, set()
         for sock in sockets:
@@ -1233,10 +1252,20 @@ def main():
     parser.add_argument("--safe-area", type=lambda value: geometry_argument(value, ",", 4),
                         help="daemon-side test crop LEFT,TOP,WIDTH,HEIGHT")
     parser.add_argument("--mpris-player", help="MPRIS player name (for example vlc); default: prefer a playing app")
+    parser.add_argument("--audio-rate", type=int, default=48000, help="client PCM rate, independent of head unit (default: 48000)")
+    parser.add_argument("--audio-channels", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--audio-format", choices=("s16_le", "f32_le"), default="s16_le")
+    parser.add_argument("--audio-source", help="PulseAudio source to capture; default: default output monitor")
+    parser.add_argument("--audio-file", help="play a signed 16-bit PCM WAV when Media is selected")
+    parser.add_argument("--microphone-file", help="record car microphone to a 16-bit PCM WAV instead of creating a desktop source")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     if (args.source_size or args.safe_area) and not args.test_source:
         parser.error("--source-size and --safe-area require --test-source")
+    try:
+        PcmFormat(args.audio_rate, args.audio_channels, args.audio_format).validate()
+    except ValueError as exc:
+        parser.error(str(exc))
     if not 0 < args.port <= 65535 or not 0 < args.bitrate <= 2048000:
         parser.error("port must be 1–65535 and bitrate must be 1–2048000 kbit/s")
     if not math.isfinite(args.timeout) or args.timeout <= 0:

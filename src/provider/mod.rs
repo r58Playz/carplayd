@@ -13,9 +13,11 @@ use crate::{
 	v4l2::VideoParams,
 };
 
+pub mod audio;
 pub mod decoder;
 pub mod frame;
 pub mod network;
+pub mod resampler;
 pub mod waiting;
 
 pub trait CarplayProvider {
@@ -34,6 +36,7 @@ pub trait CarplayProvider {
 pub trait CarplayProviderConnection {
 	type Screen: CarplayProviderScreen + 'static;
 	type Media: CarplayProviderMedia + 'static;
+	type Audio: audio::CarplayProviderAudio + 'static;
 
 	async fn process_input(&mut self, device: InputDevice, events: InputReport) -> Result<()>;
 
@@ -41,6 +44,7 @@ pub trait CarplayProviderConnection {
 	async fn get_screen(&mut self) -> Result<Self::Screen>;
 
 	async fn get_media(&mut self) -> Result<Self::Media>;
+	async fn get_audio(&mut self) -> Result<Self::Audio>;
 }
 
 /// buffer must be yuv420
@@ -66,6 +70,7 @@ enum ProviderConnectionCommand {
 	ProcessInput(InputDevice, InputReport, oneshot::Sender<Result<()>>),
 	GetScreen(oneshot::Sender<Result<Box<dyn CarplayProviderScreen>>>),
 	GetMedia(oneshot::Sender<Result<Box<dyn CarplayProviderMedia>>>),
+	GetAudio(oneshot::Sender<Result<Box<dyn audio::CarplayProviderAudio>>>),
 }
 
 pub struct CarplayProviderConnectionServer<
@@ -83,6 +88,14 @@ impl<C: CarplayProviderConnection<Screen = S>, S: CarplayProviderScreen + 'stati
 	pub async fn run(mut self) -> Result<()> {
 		while let Some(command) = self.1.recv().await {
 			match command {
+				ProviderConnectionCommand::GetAudio(tx) => {
+					let _ = tx.send(
+						self.0
+							.get_audio()
+							.await
+							.map(|x| Box::new(x) as Box<dyn audio::CarplayProviderAudio>),
+					);
+				}
 				ProviderConnectionCommand::ProcessInput(device, event, tx) => {
 					let _ = tx.send(self.0.process_input(device, event).await);
 				}
@@ -112,6 +125,13 @@ impl<C: CarplayProviderConnection<Screen = S>, S: CarplayProviderScreen + 'stati
 #[derive(Clone)]
 pub struct CarplayProviderConnectionProxy(mpsc::UnboundedSender<ProviderConnectionCommand>);
 impl CarplayProviderConnectionProxy {
+	pub async fn get_audio(&self) -> Result<Box<dyn audio::CarplayProviderAudio>> {
+		let (tx, rx) = oneshot::channel();
+		self.0
+			.send(ProviderConnectionCommand::GetAudio(tx))
+			.context("failed to ask for audio")?;
+		rx.await.context("failed to wait for audio")?
+	}
 	pub async fn get_screen(&self) -> Result<Box<dyn CarplayProviderScreen>> {
 		let (tx, rx) = oneshot::channel();
 		self.0

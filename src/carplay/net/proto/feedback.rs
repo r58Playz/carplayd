@@ -31,21 +31,61 @@ pub struct FeedbackResponse {
 }
 
 /// One stream's timing report (Table 30-57).
+///
+/// The table marks everything but `sr` required, but real head units have been seen sending
+/// just `type` and `sr`, with no connection ID and no clock pair. Only `type` is enforced.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeedbackStream {
 	pub r#type: StreamType,
-	#[serde(rename = "streamConnectionID")]
-	pub stream_connection_id: i64,
+	#[serde(
+		default,
+		rename = "streamConnectionID",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub stream_connection_id: Option<i64>,
 	/// Media timestamp at the same instant as `timestamp`.
-	pub sample_time: f64,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub sample_time: Option<f64>,
 	/// Synchronised wall clock — our clock, as the accessory has estimated it — at the same
 	/// instant as `sample_time`.
-	pub timestamp: f64,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub timestamp: Option<f64>,
 	/// The same instant on the accessory's own undisciplined clock.
-	pub timestamp_raw_ns: i64,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub timestamp_raw_ns: Option<i64>,
 	/// Estimated consumption rate in samples per second, derived from the pair above.
 	/// Required for audio streams.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub sr: Option<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+	use plist::Value;
+
+	use super::*;
+	use crate::carplay::net::proto::from_value;
+
+	/// What a real head unit answered: just `type` and `sr`, no connection ID or clock pair.
+	#[test]
+	fn a_rate_only_response_parses() {
+		let mut stream = plist::Dictionary::new();
+		stream.insert("type".into(), Value::Integer(100.into()));
+		stream.insert("sr".into(), Value::Real(48000.0));
+
+		let mut dict = plist::Dictionary::new();
+		dict.insert(
+			"streams".into(),
+			Value::Array(vec![Value::Dictionary(stream)]),
+		);
+
+		let response: FeedbackResponse = from_value(&Value::Dictionary(dict)).unwrap();
+		let streams = response.streams.unwrap();
+
+		assert_eq!(streams[0].r#type, StreamType::MainAudio);
+		assert_eq!(streams[0].sr, Some(48000.0));
+		assert_eq!(streams[0].stream_connection_id, None);
+		assert_eq!(streams[0].timestamp, None);
+	}
 }

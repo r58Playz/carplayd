@@ -329,7 +329,11 @@ impl ModesResource {
 		}
 	}
 
-	pub fn untake(&mut self, entity: ModesEntity, handback_entity: Option<ModesEntity>) -> Result<bool> {
+	pub fn untake(
+		&mut self,
+		entity: ModesEntity,
+		handback_entity: Option<ModesEntity>,
+	) -> Result<bool> {
 		if self.entity != entity {
 			if self.owner() == entity {
 				return Ok(false);
@@ -346,8 +350,19 @@ impl ModesResource {
 
 		Ok(true)
 	}
+
+	/// Release this entity's claims while preserving the other entity's borrow.
+	pub fn release(&mut self, entity: ModesEntity, handback: ModesEntity) {
+		self.borrows.retain(|borrow| borrow.entity != entity);
+		if self.entity == entity {
+			self.entity = handback;
+			self.take_constraint = ModesConstraint::Anytime;
+			self.borrow_constraint = ModesConstraint::Anytime;
+		}
+	}
 }
 
+#[derive(Clone)]
 pub struct ModesMachine {
 	main_screen: ModesResource,
 	main_audio: ModesResource,
@@ -531,7 +546,11 @@ impl ModesMachine {
 		Ok(self.current_modes())
 	}
 
-	pub fn inspect_resource<T>(&self, id: ModesResourceId, func: impl Fn(&ModesResource) -> T) -> T {
+	pub fn inspect_resource<T>(
+		&self,
+		id: ModesResourceId,
+		func: impl Fn(&ModesResource) -> T,
+	) -> T {
 		let resource = match id {
 			ModesResourceId::MainScreen => &self.main_screen,
 			ModesResourceId::MainAudio => &self.main_audio,

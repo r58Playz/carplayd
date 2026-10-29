@@ -1,4 +1,5 @@
 use std::{
+	collections::HashMap,
 	future::Future,
 	net::{IpAddr, Ipv4Addr, SocketAddr},
 	path::Path,
@@ -30,6 +31,7 @@ use crate::{
 	provider::{
 		CarplayProvider, CarplayProviderConnection, CarplayProviderMedia, CarplayProviderScreen,
 		MediaEvent,
+		audio::{AudioEvent, AudioState, AudioStatus},
 		decoder::{
 			VideoDecoderConfig, VideoDecoderInput, VideoDecoderOutput, create_video_decoder,
 		},
@@ -39,6 +41,7 @@ use crate::{
 	v4l2::VideoParams,
 };
 
+mod audio;
 mod protocol;
 
 const V4L2_DEVICE: &str = "/dev/video10";
@@ -47,11 +50,13 @@ enum ProviderEvent {
 	ReceivedMessage(BytesMut),
 	GetScreen(oneshot::Sender<Result<CarplayDebugNetworkProviderScreen>>),
 	GetMedia(oneshot::Sender<CarplayDebugNetworkProviderMedia>),
+	GetAudio(oneshot::Sender<Result<audio::NetworkAudio>>),
+	AudioStatus(AudioStatus),
 	ProcessInput(InputDevice, InputReport, oneshot::Sender<Result<()>>),
 }
 
 /// One response and one TCP connection complete a display request. The task
-/// never reads control; the main loop keeps dispatching input and metadata.
+/// never reads control; the main loop keeps dispatching audio and metadata.
 struct PendingDisplay {
 	response: Option<oneshot::Sender<Option<FrameCrop>>>,
 	reply: oneshot::Sender<Result<CarplayDebugNetworkProviderScreen>>,
@@ -148,6 +153,7 @@ pub struct CarplayDebugNetworkProvider {
 	video: Option<VideoParams>,
 	input: Option<Vec<InputDevice>>,
 	ctrl: Option<mpsc::UnboundedReceiver<ProviderEvent>>,
+	event_tx: Option<mpsc::UnboundedSender<ProviderEvent>>,
 }
 impl CarplayDebugNetworkProvider {
 	pub fn new(port: u16) -> Self {
@@ -157,6 +163,7 @@ impl CarplayDebugNetworkProvider {
 			video: None,
 			input: None,
 			ctrl: None,
+			event_tx: None,
 		}
 	}
 }
@@ -173,6 +180,7 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 		self.video.replace(video);
 		self.input.replace(input);
 		self.ctrl.replace(ctrl_rx);
+		self.event_tx.replace(ctrl_tx.clone());
 
 		let listener = TcpListener::bind(SocketAddr::new(
 			IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -204,7 +212,11 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 		let input_devices = self.input.take().unwrap();
 		let mut stream = self.stream.take().unwrap();
 		let mut ctrl = self.ctrl.take().unwrap();
+		let event_tx = self.event_tx.take().unwrap();
 		let peer = stream.get_ref().peer_addr()?.ip();
+		let (audio_tx, audio_rx) = mpsc::channel(16);
+		let mut audio_rx = Some(audio_rx);
+		let mut audio_progress = HashMap::<u64, audio::SinkProgress>::new();
 		let mut pending_display = None;
 
 		let (now_playing_tx, now_playing_rx) = watch::channel(None);
@@ -216,6 +228,7 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 					display_height: video_params.height,
 					display_fps: video_params.fps,
 					input_devices,
+					audio: Some(protocol::AudioCapabilities::default()),
 				})
 				.context("failed to serialize")?
 				.into(),
@@ -239,8 +252,39 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 			};
 			match ev {
 				ProviderEvent::ReceivedMessage(x) => {
-					let parsed = serde_json::from_slice::<ProviderReceivedMessage>(&x)
-						.context("failed to read provider recvd message")?;
+					let parsed = match serde_json::from_slice::<ProviderReceivedMessage>(&x) {
+						Ok(message) => message,
+						Err(error) => {
+							let value: serde_json::Value = serde_json::from_slice(&x)?;
+							if value
+								.get("type")
+								.and_then(|x| x.as_str())
+								.is_some_and(|x| x.starts_with("audio_"))
+							{
+								let id = value
+									.get("id")
+									.or_else(|| value.get("request").and_then(|x| x.get("id")))
+									.and_then(|x| x.as_u64())
+									.unwrap_or(0);
+								let status = AudioStatus {
+									id,
+									state: AudioState::Error,
+									wire_format: None,
+									detail: Some(error.to_string()),
+								};
+								stream
+									.send(
+										serde_json::to_vec(&ProviderSentMessage::AudioStatus {
+											status,
+										})?
+										.into(),
+									)
+									.await?;
+								continue;
+							}
+							return Err(error).context("failed to read provider message");
+						}
+					};
 					match parsed {
 						ProviderReceivedMessage::DisplayResponse { safe_area } => {
 							pending_display
@@ -252,6 +296,115 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 							now_playing_tx
 								.send(now_playing)
 								.context("failed to send now_playing")?;
+						}
+						message => {
+							let id = match &message {
+								ProviderReceivedMessage::AudioStart { request } => request.id,
+								ProviderReceivedMessage::AudioStop { id }
+								| ProviderReceivedMessage::AudioFlush { id }
+								| ProviderReceivedMessage::AudioDuck { id, .. }
+								| ProviderReceivedMessage::AudioUnduck { id, .. }
+								| ProviderReceivedMessage::AudioInputProgress { id, .. } => *id,
+								_ => 0,
+							};
+							let mut prepared = false;
+							let result: Result<()> = async {
+								let event = match message {
+									ProviderReceivedMessage::AudioStart { request } => {
+										anyhow::ensure!(
+											!audio_progress.contains_key(&id),
+											"audio request ID is already active"
+										);
+										let (port, endpoints, progress) =
+											audio::open(&request, peer).await?;
+										stream
+											.send(
+												serde_json::to_vec(
+													&ProviderSentMessage::AudioRequest { id, port },
+												)?
+												.into(),
+											)
+											.await?;
+										audio_progress.insert(id, progress);
+										prepared = true;
+										AudioEvent::Start(request, endpoints)
+									}
+									ProviderReceivedMessage::AudioStop { id } => {
+										AudioEvent::Stop(id)
+									}
+									ProviderReceivedMessage::AudioFlush { id } => {
+										AudioEvent::Flush(id)
+									}
+									ProviderReceivedMessage::AudioDuck {
+										id,
+										duration_ms,
+										volume,
+									} => {
+										anyhow::ensure!(
+											volume.is_finite()
+												&& (0.0..=1.0).contains(&volume)
+												&& duration_ms <= 10_000,
+											"invalid duck parameters"
+										);
+										AudioEvent::Duck {
+											id,
+											duration_ms,
+											volume,
+										}
+									}
+									ProviderReceivedMessage::AudioUnduck { id, duration_ms } => {
+										anyhow::ensure!(
+											duration_ms <= 10_000,
+											"invalid unduck duration"
+										);
+										AudioEvent::Unduck { id, duration_ms }
+									}
+									ProviderReceivedMessage::AudioAppState {
+										speech,
+										phone_call,
+										turn_by_turn,
+									} => AudioEvent::AppState {
+										speech,
+										phone_call,
+										turn_by_turn,
+									},
+									ProviderReceivedMessage::AudioInputProgress {
+										id,
+										consumed,
+									} => {
+										audio_progress
+											.get(&id)
+											.context("no audio stream with that ID")?
+											.update(consumed)?;
+										return Ok(());
+									}
+									_ => unreachable!(),
+								};
+								audio_tx.try_send(event).map_err(|_| {
+									anyhow::anyhow!("audio event queue unavailable")
+								})?;
+								Ok(())
+							}
+							.await;
+							if let Err(error) = result {
+								if prepared {
+									audio_progress.remove(&id);
+								}
+								let status = AudioStatus {
+									id,
+									state: AudioState::Error,
+									wire_format: None,
+									detail: Some(format!("{error:#}")),
+								};
+								stream
+									.send(
+										serde_json::to_vec(&ProviderSentMessage::AudioStatus {
+											status,
+										})?
+										.into(),
+									)
+									.await?;
+							}
 						}
 					}
 				}
@@ -274,6 +427,25 @@ impl CarplayProvider for CarplayDebugNetworkProvider {
 					let _ = tx.send(CarplayDebugNetworkProviderMedia {
 						now_playing_rx: now_playing_rx.clone(),
 					});
+				}
+				ProviderEvent::GetAudio(tx) => {
+					let _ = tx.send(audio_rx.take().context("audio already acquired").map(|rx| {
+						audio::NetworkAudio {
+							rx,
+							tx: event_tx.clone(),
+						}
+					}));
+				}
+				ProviderEvent::AudioStatus(status) => {
+					if matches!(status.state, AudioState::Stopped | AudioState::Error) {
+						audio_progress.remove(&status.id);
+					}
+					stream
+						.send(
+							serde_json::to_vec(&ProviderSentMessage::AudioStatus { status })?
+								.into(),
+						)
+						.await?;
 				}
 				ProviderEvent::ProcessInput(device, report, tx) => {
 					let _ = tx.send(
@@ -303,6 +475,15 @@ pub struct CarplayDebugNetworkProviderConnection(mpsc::UnboundedSender<ProviderE
 impl CarplayProviderConnection for CarplayDebugNetworkProviderConnection {
 	type Screen = CarplayDebugNetworkProviderScreen;
 	type Media = CarplayDebugNetworkProviderMedia;
+	type Audio = audio::NetworkAudio;
+
+	async fn get_audio(&mut self) -> Result<Self::Audio> {
+		let (tx, rx) = oneshot::channel();
+		self.0
+			.send(ProviderEvent::GetAudio(tx))
+			.context("failed to request audio")?;
+		rx.await.context("failed to wait for audio")?
+	}
 
 	async fn get_media(&mut self) -> Result<Self::Media> {
 		let (tx, rx) = oneshot::channel();
@@ -582,7 +763,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn control_dispatches_metadata_during_both_display_stages() {
+	async fn control_dispatches_metadata_and_audio_during_both_display_stages() {
 		let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
 		let client = TcpStream::connect(listener.local_addr().unwrap())
 			.await
@@ -599,6 +780,7 @@ mod tests {
 			video: Some(test_params()),
 			input: Some(vec![]),
 			ctrl: Some(rx),
+			event_tx: Some(tx.clone()),
 		};
 		let running = tokio::spawn(provider.run());
 		let mut client = LengthDelimitedCodec::builder()
@@ -648,6 +830,25 @@ mod tests {
 				.unwrap()
 				.unwrap();
 		}
+		let (audio_tx, audio_rx) = oneshot::channel();
+		tx.send(ProviderEvent::GetAudio(audio_tx)).unwrap();
+		let mut audio = tokio::time::timeout(Duration::from_secs(1), audio_rx)
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		client
+			.send(br#"{"type":"audio_stop","id":77}"#.as_slice().into())
+			.await
+			.unwrap();
+		use crate::provider::audio::CarplayProviderAudio;
+		assert!(matches!(
+			tokio::time::timeout(Duration::from_secs(1), audio.next_event())
+				.await
+				.unwrap()
+				.unwrap(),
+			Some(AudioEvent::Stop(77))
+		));
 		drop(client);
 		tokio::time::timeout(Duration::from_secs(1), running)
 			.await

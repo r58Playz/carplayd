@@ -48,6 +48,7 @@ use crate::{
 	v4l2::VideoParams,
 };
 
+mod audio;
 pub mod codec;
 mod conn;
 pub mod head_unit;
@@ -59,8 +60,10 @@ pub mod timing;
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum NetSessionStream {
 	Screen,
+	Audio(crate::provider::audio::AudioKind, u64),
 }
 struct NetSessionStreamFutures {
+	audio: HashMap<crate::provider::audio::AudioKind, audio::RunningAudio>,
 	screen: Option<(
 		mpsc::UnboundedSender<EncoderCommand>,
 		AbortOnDropHandle<Result<()>>,
@@ -68,7 +71,10 @@ struct NetSessionStreamFutures {
 }
 impl NetSessionStreamFutures {
 	pub fn new() -> Self {
-		Self { screen: None }
+		Self {
+			screen: None,
+			audio: HashMap::new(),
+		}
 	}
 
 	pub fn has_screen(&self) -> bool {
@@ -95,6 +101,21 @@ impl NetSessionStreamFutures {
 	}
 
 	fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<(NetSessionStream, Result<()>)> {
+		let mut completed = None;
+		for (&kind, stream) in &mut self.audio {
+			if let Poll::Ready(result) = Pin::new(&mut stream.task).poll(cx) {
+				completed = Some((
+					kind,
+					stream.id,
+					result.context("failed to join audio stream").flatten(),
+				));
+				break;
+			}
+		}
+		if let Some((kind, id, result)) = completed {
+			self.audio.remove(&kind);
+			return Poll::Ready((NetSessionStream::Audio(kind, id), result));
+		}
 		if let Some(fut) = self.screen.as_mut()
 			&& let Poll::Ready(res) = Pin::new(&mut fut.1).poll(cx)
 		{
@@ -121,6 +142,8 @@ enum NetSessionEvent {
 		oneshot::Receiver<()>,
 	),
 	FeedbackTimer,
+	Audio(crate::provider::audio::AudioEvent),
+	AudioClosed,
 }
 
 pub struct CarplayNetSession {
@@ -139,6 +162,8 @@ pub struct CarplayNetSession {
 	events: Option<HeadUnitTcpConnection>,
 
 	proxy: watch::Receiver<Option<CarplayProviderConnectionProxy>>,
+	audio_requests: HashMap<crate::provider::audio::AudioKind, audio::RequestedAudio>,
+	audio_status: Vec<crate::provider::audio::AudioStatus>,
 }
 
 fn associated_display(uuid: String) -> Option<String> {
@@ -302,6 +327,8 @@ impl CarplayNetSession {
 			control,
 			events: Some(events),
 			proxy,
+			audio_requests: HashMap::new(),
+			audio_status: Vec::new(),
 		})
 	}
 
@@ -453,6 +480,7 @@ impl CarplayNetSession {
 			_ => {}
 		}
 
+		self.reconcile_audio(streams).await?;
 		Ok(())
 	}
 
@@ -680,8 +708,44 @@ impl CarplayNetSession {
 		}
 
 		let mut feedback_timer = tokio::time::interval(Duration::from_millis(500));
+		let mut provider_proxy = self.proxy.clone();
+		let mut audio_provider = Box::pin(async move {
+			let proxy = provider_proxy
+				.wait_for(Option::is_some)
+				.await
+				.context("provider disappeared")?
+				.clone()
+				.unwrap();
+			proxy.get_audio().await
+		});
+		let mut provider_loaded = false;
+		let mut provider_closed = false;
+		let mut provider_audio: Option<Box<dyn crate::provider::audio::CarplayProviderAudio>> =
+			None;
+		let result = async {
 		loop {
+			for status in self.audio_status.drain(..) {
+				if let Some(provider) = &mut provider_audio {
+					if let Err(error) = provider.status(status).await { warn!("failed to report audio status: {error:#}"); }
+				}
+			}
 			let Some(ev) = select!(
+				provider = &mut audio_provider, if !provider_loaded => {
+					provider_loaded = true;
+					match provider { Ok(provider) => provider_audio = Some(provider), Err(error) => { warn!("audio provider unavailable: {error:#}"); provider_closed = true; } }
+					continue;
+				},
+				event = async {
+					match &mut provider_audio {
+						Some(provider) => provider.next_event().await,
+						None => std::future::pending().await,
+					}
+				}, if !provider_closed => {
+					match event {
+						Ok(Some(event)) => Some(NetSessionEvent::Audio(event)),
+						result => { if let Err(error) = result { warn!("audio provider ended: {error:#}"); } Some(NetSessionEvent::AudioClosed) }
+					}
+				},
 				x = &mut events => bail!("events died!!! {x:?}"),
 				event = rx.recv() => event,
 				(stream, res) = streams.next() => Some(NetSessionEvent::Stream(stream, res)),
@@ -690,7 +754,16 @@ impl CarplayNetSession {
 				break Ok(());
 			};
 			match ev {
+				NetSessionEvent::Audio(event) => self.handle_audio_event(event, &mut streams).await?,
+				NetSessionEvent::AudioClosed => {
+					provider_closed = true;
+					self.close_audio(&mut streams).await;
+				}
 				NetSessionEvent::Stream(stream, res) => {
+					if let NetSessionStream::Audio(kind, id) = stream {
+						self.audio_finished(kind, id, res, &mut streams).await?;
+						continue;
+					}
 					if let Err(err) = res {
 						warn!("task for stream {stream:?} died {err:?}");
 					} else {
@@ -699,6 +772,7 @@ impl CarplayNetSession {
 
 					let resource = match stream {
 						NetSessionStream::Screen => ModesResourceId::MainScreen,
+						NetSessionStream::Audio(..) => unreachable!(),
 					};
 
 					let mut modes = None;
@@ -742,7 +816,7 @@ impl CarplayNetSession {
 						.context("failed to service accessory command")?;
 				}
 				NetSessionEvent::FeedbackTimer => {
-					self.control
+					let feedback = self.control
 						.req_opt::<FeedbackResponse>(
 							Method::Post,
 							"/feedback",
@@ -750,8 +824,29 @@ impl CarplayNetSession {
 						)
 						.await
 						.context("failed to POST /feedback")?;
+					if let Some(feedback) = feedback {
+						for report in feedback.streams.unwrap_or_default() {
+							for (&kind, stream) in &mut streams.audio {
+								// There is at most one stream per type, so a missing connection ID is unambiguous.
+								if report.r#type != kind.stream_type() || report.stream_connection_id.is_some_and(|id| id != stream.connection_id) { continue; }
+								let mut report = report.clone();
+								let clock = report.timestamp.zip(report.sample_time).filter(|(time, sample)| time.is_finite() && sample.is_finite());
+								if let Some((time, sample)) = clock {
+									if stream.last_clock.is_some_and(|(last, _)| time <= last) { continue; }
+									if report.sr.is_none() {
+										report.sr = stream.last_clock.map(|(last_time, last_sample)| (sample - last_sample) / (time - last_time));
+									}
+									stream.last_clock = Some((time, sample));
+								}
+								stream.control.send_modify(|control| control.update_rate(&report, stream.format.sample_rate));
+							}
+						}
+					}
 				}
 			}
 		}
+		}.await;
+		self.close_audio(&mut streams).await;
+		result
 	}
 }
